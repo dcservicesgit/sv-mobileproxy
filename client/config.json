@@ -2,6 +2,6 @@
     "nodename": "Development",
     "key": "",
     "wans": [
-  
+        "en0"
     ]
 }
