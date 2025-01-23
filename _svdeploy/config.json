@@ -1,0 +1,59 @@
+{
+    "version": "1.0.0",
+    "deploymentSteps": [
+        {
+            "util": true,
+            "step": "defaultCreateAppUser",
+            "task": "",
+            "description": "",
+            "targethost": "remote",
+            "group": "all"
+        },
+        {
+            "util": true,
+            "step": "defaultUpdateRemoteFiles",
+            "task": "",
+            "description": "",
+            "targethost": "remote",
+            "group": "all"
+        },
+        {
+            "util": true,
+            "step": "defaultSetupPM2",
+            "task": "",
+            "description": "",
+            "targethost": "remote",
+            "group": "all"
+        },
+        {
+            "util": true,
+            "step": "defaultSetupNginx",
+            "task": "",
+            "description": "",
+            "targethost": "remote",
+            "group": "all"
+        }
+    ],
+    "environmentVariables": {},
+    "appuser": "svmobileproxy",
+    "hosts": {
+        "defaults": {},
+        "51.68.214.201": {
+            "setupnginx": true,
+            "groupfilter": null,
+            "nginx_rules": [
+                {
+                    "domainName": "multiproxy.superv.co.uk",
+                    "paths": [
+                        {
+                            "path": "/",
+                            "backend_servers": [
+                                "127.0.0.1:3000"
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
