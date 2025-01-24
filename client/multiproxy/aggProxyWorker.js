@@ -174,10 +174,18 @@ function updatePortPool(newPortPool) {
  */
 const server = http.createServer((clientReq, clientRes) => {
     // Extract authentication from headers
-    const authHeader = clientReq.headers['authorization'];
+    // Extract Proxy-Authorization from headers
+    const authHeader = clientReq.headers['proxy-authorization'];
     if (!authHeader || !authHeader.startsWith('Basic ')) {
-        clientRes.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Proxy"' });
-        return clientRes.end('Authentication required.');
+        // Respond with 407 Proxy Authentication Required
+        clientRes.write(
+            "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+            "Proxy-Authenticate: Basic realm=\"Proxy\"\r\n" +
+            "\r\n"
+        );
+        clientRes.writeHead(407, { 'Content-Type': 'text/plain' });
+        clientRes.end('Proxy authentication required.');
+        return;
     }
 
     // Decode Base64 credentials

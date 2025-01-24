@@ -270,7 +270,7 @@ class MultiProxy {
                     path: targetUrl, // Full URL for proxy request
                     headers: {
                         Host: 'httpbin.org', // Set Host header for the target server
-                        Authorization: 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64'),
+                        "Proxy-Authorization": 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64'),
                     },
                     // Optionally, you can set a timeout
                     timeout: 5000, // in milliseconds
