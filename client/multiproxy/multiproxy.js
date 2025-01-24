@@ -19,7 +19,7 @@ class MultiProxy {
         this.adaptormap = {};
         this.adaptormapConnect = {};
         this.bindPort = 8980
-        this.screenOn = true
+        this.screenOn = false
     }
 
     async startSystem() {
@@ -73,6 +73,8 @@ class MultiProxy {
             if (!successAgg) {
                 console.error('Proxy endpoint check failed. Taking corrective action...');
                 // Add your failure handling logic here
+
+                Aggregator.portPool = []
             }
         }, 10000);
     }

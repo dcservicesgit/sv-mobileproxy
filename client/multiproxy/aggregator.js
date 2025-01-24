@@ -92,6 +92,7 @@ module.exports = {
         // Notify all running workers about the portPool update
         Object.values(module.exports.proxyservers).forEach(({ worker }) => {
             if (worker && worker.postMessage) {
+
                 worker.postMessage({
                     type: 'updatePortPool',
                     portPool: newPortPool,

@@ -6,6 +6,19 @@ const { PassThrough } = require("stream");
 let { outboundIP, uniqueid, blocklist } = workerData;
 let aggregatedUsage = {}; // Tracks data usage
 
+// Add at the top of your aggProxyWorker.js
+process.on('uncaughtException', (err) => {
+    console.error(`[Worker ${uniqueid}] Uncaught Exception: ${err.stack || err}`);
+    // Decide whether to exit or attempt recovery
+    // process.exit(1); // Optional: Exit the process
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`[Worker ${uniqueid}] Unhandled Rejection at:`, promise, 'reason:', reason);
+    // Decide whether to exit or attempt recovery
+    // process.exit(1); // Optional: Exit the process
+});
+
 function incrementUsage(domain, direction, numBytes) {
     if (!domain) return;
     if (!aggregatedUsage[domain]) {

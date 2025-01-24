@@ -10,6 +10,19 @@ let portPool = Array.isArray(workerData.portPool) ? workerData.portPool : [];
 const uniqueid = workerData.uniqueid || 'Agg';
 const blocklist = Array.isArray(workerData.blocklist) ? workerData.blocklist : [];
 
+// Add at the top of your aggProxyWorker.js
+process.on('uncaughtException', (err) => {
+    console.error(`[Worker ${uniqueid}] Uncaught Exception: ${err.stack || err}`);
+    // Decide whether to exit or attempt recovery
+    // process.exit(1); // Optional: Exit the process
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error(`[Worker ${uniqueid}] Unhandled Rejection at:`, promise, 'reason:', reason);
+    // Decide whether to exit or attempt recovery
+    // process.exit(1); // Optional: Exit the process
+});
+
 // Initialize usage tracking
 const aggregatedUsage = {}; // e.g., { "example.com": { upload: 12345, download: 67890 } }
 
@@ -107,6 +120,9 @@ function assignPortToCredentials(username, password) {
         releasePortFromCredentials(username, password);
     }, 5 * 60 * 1000); // 5 minutes
 
+    if (bypasslimit) {
+        return port
+    }
     // Store the mapping
     credentialToPortMap.set(credentialKey, { port, timeout });
     console.log(`[Worker ${uniqueid}] Assigned port ${port} to credentials ${credentialKey} for 5 minutes`);
@@ -146,197 +162,207 @@ function updatePortPool(newPortPool) {
  */
 const server = http.createServer((clientReq, clientRes) => {
     // Extract authentication from headers
-    const authHeader = clientReq.headers['authorization'];
-    if (!authHeader || !authHeader.startsWith('Basic ')) {
-        clientRes.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Proxy"' });
-        return clientRes.end('Authentication required.');
-    }
-
-    // Decode Base64 credentials
-    const base64Credentials = authHeader.slice(6).trim();
-    let credentials;
     try {
-        credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
-    } catch (err) {
-        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
-        return clientRes.end('Invalid Authorization header.');
-    }
+        const authHeader = clientReq.headers['authorization'];
+        if (!authHeader || !authHeader.startsWith('Basic ')) {
+            clientRes.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Proxy"' });
+            return clientRes.end('Authentication required.');
+        }
 
-    const [username, password] = credentials.split(':');
-    if (!username || !password) {
-        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
-        return clientRes.end('Invalid credentials format.');
-    }
+        // Decode Base64 credentials
+        const base64Credentials = authHeader.slice(6).trim();
+        let credentials;
+        try {
+            credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
+        } catch (err) {
+            clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
+            return clientRes.end('Invalid Authorization header.');
+        }
 
-    // Assign or retrieve the port for these credentials
-    const proxyPort = assignPortToCredentials(username, password);
+        const [username, password] = credentials.split(':');
+        if (!username || !password) {
+            clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
+            return clientRes.end('Invalid credentials format.');
+        }
 
-    if (!proxyPort) {
-        clientRes.writeHead(503, { 'Content-Type': 'text/plain' });
-        return clientRes.end('No available proxy ports.');
-    }
+        // Assign or retrieve the port for these credentials
+        const proxyPort = assignPortToCredentials(username, password);
 
-    // Increment the active connection count for the assigned proxy port
-    incrementConnection(proxyPort);
-    console.log(`[Worker ${uniqueid}] Assigned connection to proxy port ${proxyPort} for credentials ${username}:${password}`);
+        if (!proxyPort) {
+            clientRes.writeHead(503, { 'Content-Type': 'text/plain' });
+            return clientRes.end('No available proxy ports.');
+        }
 
-    // Forward the request to the selected local proxy server
-    const options = {
-        hostname: '127.0.0.1',
-        port: proxyPort,
-        path: clientReq.url,
-        method: clientReq.method,
-        headers: clientReq.headers,
-    };
+        // Increment the active connection count for the assigned proxy port
+        incrementConnection(proxyPort);
+        console.log(`[Worker ${uniqueid}] Assigned connection to proxy port ${proxyPort} for credentials ${username}:${password}`);
 
-    const proxyReq = http.request(options, (proxyRes) => {
-        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+        // Forward the request to the selected local proxy server
+        const options = {
+            hostname: '127.0.0.1',
+            port: proxyPort,
+            path: clientReq.url,
+            method: clientReq.method,
+            headers: clientReq.headers,
+        };
 
-        // PassThrough stream to count download data
-        const resCounter = new PassThrough();
-        resCounter.on('data', (chunk) => {
-            const domain = clientReq.headers.host || 'unknown';
-            incrementUsage(domain, 'download', chunk.length);
+        const proxyReq = http.request(options, (proxyRes) => {
+            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+
+            // PassThrough stream to count download data
+            const resCounter = new PassThrough();
+            resCounter.on('data', (chunk) => {
+                const domain = clientReq.headers.host || 'unknown';
+                incrementUsage(domain, 'download', chunk.length);
+            });
+
+            proxyRes.pipe(resCounter).pipe(clientRes, { end: true });
         });
 
-        proxyRes.pipe(resCounter).pipe(clientRes, { end: true });
-    });
+        // PassThrough stream to count upload data
+        const reqCounter = new PassThrough();
+        reqCounter.on('data', (chunk) => {
+            const domain = clientReq.headers.host || 'unknown';
+            incrementUsage(domain, 'upload', chunk.length);
+        });
 
-    // PassThrough stream to count upload data
-    const reqCounter = new PassThrough();
-    reqCounter.on('data', (chunk) => {
-        const domain = clientReq.headers.host || 'unknown';
-        incrementUsage(domain, 'upload', chunk.length);
-    });
+        clientReq.pipe(reqCounter).pipe(proxyReq, { end: true });
 
-    clientReq.pipe(reqCounter).pipe(proxyReq, { end: true });
+        proxyReq.on('error', (err) => {
+            console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request error: ${err.message}`);
+            if (!clientRes.headersSent) {
+                clientRes.writeHead(500);
+            }
+            clientRes.end('Internal Server Error');
+            // Decrement the active connection count on error
+            decrementConnection(proxyPort);
+        });
 
-    proxyReq.on('error', (err) => {
-        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request error: ${err.message}`);
-        if (!clientRes.headersSent) {
-            clientRes.writeHead(500);
-        }
-        clientRes.end('Internal Server Error');
-        // Decrement the active connection count on error
-        decrementConnection(proxyPort);
-    });
+        proxyReq.on('timeout', () => {
+            console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request timed out`);
+            proxyReq.destroy();
+            if (!clientRes.headersSent) {
+                clientRes.writeHead(504);
+            }
+            clientRes.end('Gateway Timeout');
+            // Decrement the active connection count on timeout
+            decrementConnection(proxyPort);
+        });
 
-    proxyReq.on('timeout', () => {
-        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request timed out`);
-        proxyReq.destroy();
-        if (!clientRes.headersSent) {
-            clientRes.writeHead(504);
-        }
-        clientRes.end('Gateway Timeout');
-        // Decrement the active connection count on timeout
-        decrementConnection(proxyPort);
-    });
+        // When the client response finishes, decrement the active connection count
+        clientRes.on('finish', () => {
+            decrementConnection(proxyPort);
+            console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Connection closed`);
+        });
+    } catch (error) {
+        console.log(`${error.message}`)
+    }
 
-    // When the client response finishes, decrement the active connection count
-    clientRes.on('finish', () => {
-        decrementConnection(proxyPort);
-        console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Connection closed`);
-    });
 });
 
 /**
  * Handles HTTPS tunneling via CONNECT method by routing them to the assigned proxy port based on credentials.
  */
 server.on('connect', (req, clientSocket, head) => {
-    // Extract authentication from headers
-    const authHeader = req.headers['authorization'];
-    if (!authHeader || !authHeader.startsWith('Basic ')) {
-        clientSocket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Proxy\"\r\n\r\n");
-        clientSocket.end('Authentication required.');
-        return;
-    }
-
-    // Decode Base64 credentials
-    const base64Credentials = authHeader.slice(6).trim();
-    let credentials;
     try {
-        credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
-    } catch (err) {
-        clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-        clientSocket.end('Invalid Authorization header.');
-        return;
+        // Extract authentication from headers
+        const authHeader = req.headers['authorization'];
+        if (!authHeader || !authHeader.startsWith('Basic ')) {
+            clientSocket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Proxy\"\r\n\r\n");
+            clientSocket.end('Authentication required.');
+            return;
+        }
+
+        // Decode Base64 credentials
+        const base64Credentials = authHeader.slice(6).trim();
+        let credentials;
+        try {
+            credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
+        } catch (err) {
+            clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+            clientSocket.end('Invalid Authorization header.');
+            return;
+        }
+
+        const [username, password] = credentials.split(':');
+        if (!username || !password) {
+            clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+            clientSocket.end('Invalid credentials format.');
+            return;
+        }
+
+        // Assign or retrieve the port for these credentials
+        const proxyPort = assignPortToCredentials(username, password);
+
+        if (!proxyPort) {
+            clientSocket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+            return clientSocket.end('No available proxy ports.');
+        }
+
+        // Increment the active connection count for the assigned proxy port
+        incrementConnection(proxyPort);
+        console.log(`[Worker ${uniqueid}] Assigned CONNECT to proxy port ${proxyPort} for credentials ${username}:${password}`);
+
+        const [destHostname, destPort] = req.url.split(':');
+
+        // Check against the blocklist
+        if (blocklist.map(domain => domain.toLowerCase()).includes(destHostname.toLowerCase())) {
+            console.warn(`[Worker ${uniqueid}] Blocked CONNECT request for: ${destHostname}`);
+            clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+            clientSocket.end();
+            // Decrement the active connection count for blocked requests
+            decrementConnection(proxyPort);
+            return;
+        }
+
+        const proxySocket = net.connect(proxyPort, '127.0.0.1', () => {
+            clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+            // Pipe initial data
+            if (head && head.length) proxySocket.write(head);
+            // Pipe data between client and proxy
+            clientSocket.pipe(proxySocket);
+            proxySocket.pipe(clientSocket);
+        });
+
+        // Data counting for CONNECT
+        proxySocket.on('data', (chunk) => {
+            const domain = destHostname || 'unknown';
+            incrementUsage(domain, 'download', chunk.length);
+        });
+
+        clientSocket.on('data', (chunk) => {
+            const domain = destHostname || 'unknown';
+            incrementUsage(domain, 'upload', chunk.length);
+        });
+
+        proxySocket.on('error', (err) => {
+            console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy socket error: ${err.message}`);
+            clientSocket.end();
+            // Decrement the active connection count on error
+            decrementConnection(proxyPort);
+        });
+
+        clientSocket.on('error', (err) => {
+            console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client socket error: ${err.message}`);
+            proxySocket.end();
+            // Decrement the active connection count on error
+            decrementConnection(proxyPort);
+        });
+
+        // When the connection is closed, decrement the active connection count
+        proxySocket.on('close', () => {
+            decrementConnection(proxyPort);
+            console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] CONNECT connection closed`);
+        });
+
+        clientSocket.on('close', () => {
+            decrementConnection(proxyPort);
+            console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client connection closed`);
+        });
+
+    } catch (error) {
+        console.log(`${error.message}`)
     }
-
-    const [username, password] = credentials.split(':');
-    if (!username || !password) {
-        clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-        clientSocket.end('Invalid credentials format.');
-        return;
-    }
-
-    // Assign or retrieve the port for these credentials
-    const proxyPort = assignPortToCredentials(username, password);
-
-    if (!proxyPort) {
-        clientSocket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
-        return clientSocket.end('No available proxy ports.');
-    }
-
-    // Increment the active connection count for the assigned proxy port
-    incrementConnection(proxyPort);
-    console.log(`[Worker ${uniqueid}] Assigned CONNECT to proxy port ${proxyPort} for credentials ${username}:${password}`);
-
-    const [destHostname, destPort] = req.url.split(':');
-
-    // Check against the blocklist
-    if (blocklist.map(domain => domain.toLowerCase()).includes(destHostname.toLowerCase())) {
-        console.warn(`[Worker ${uniqueid}] Blocked CONNECT request for: ${destHostname}`);
-        clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-        clientSocket.end();
-        // Decrement the active connection count for blocked requests
-        decrementConnection(proxyPort);
-        return;
-    }
-
-    const proxySocket = net.connect(proxyPort, '127.0.0.1', () => {
-        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-        // Pipe initial data
-        if (head && head.length) proxySocket.write(head);
-        // Pipe data between client and proxy
-        clientSocket.pipe(proxySocket);
-        proxySocket.pipe(clientSocket);
-    });
-
-    // Data counting for CONNECT
-    proxySocket.on('data', (chunk) => {
-        const domain = destHostname || 'unknown';
-        incrementUsage(domain, 'download', chunk.length);
-    });
-
-    clientSocket.on('data', (chunk) => {
-        const domain = destHostname || 'unknown';
-        incrementUsage(domain, 'upload', chunk.length);
-    });
-
-    proxySocket.on('error', (err) => {
-        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy socket error: ${err.message}`);
-        clientSocket.end();
-        // Decrement the active connection count on error
-        decrementConnection(proxyPort);
-    });
-
-    clientSocket.on('error', (err) => {
-        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client socket error: ${err.message}`);
-        proxySocket.end();
-        // Decrement the active connection count on error
-        decrementConnection(proxyPort);
-    });
-
-    // When the connection is closed, decrement the active connection count
-    proxySocket.on('close', () => {
-        decrementConnection(proxyPort);
-        console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] CONNECT connection closed`);
-    });
-
-    clientSocket.on('close', () => {
-        decrementConnection(proxyPort);
-        console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client connection closed`);
-    });
 });
 
 /**
