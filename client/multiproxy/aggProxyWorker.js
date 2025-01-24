@@ -57,7 +57,7 @@ function sendUsageUpdate() {
 }
 
 // Send usage updates every second.
-setInterval(sendUsageUpdate, 1000);
+//setInterval(sendUsageUpdate, 1000);
 
 /**
  * Mapping table to track active connections per proxy port.

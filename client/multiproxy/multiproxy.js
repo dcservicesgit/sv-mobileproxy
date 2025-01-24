@@ -19,7 +19,7 @@ class MultiProxy {
         this.adaptormap = {};
         this.adaptormapConnect = {};
         this.bindPort = 8980
-        this.screenOn = false
+        this.screenOn = true
     }
 
     async startSystem() {

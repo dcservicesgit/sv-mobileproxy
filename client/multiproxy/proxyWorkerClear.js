@@ -31,7 +31,6 @@ function incrementUsage(domain, direction, numBytes) {
 setInterval(() => {
     if (Object.keys(aggregatedUsage).length > 0) {
         parentPort.postMessage({ type: "usageUpdate", data: aggregatedUsage });
-        aggregatedUsage = {}; // Reset after sending
     }
 }, 1000);
 
@@ -101,6 +100,8 @@ server.on("connect", (req, clientSocket, head) => {
         clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         targetSocket.write(head);
         clientSocket.pipe(targetSocket).pipe(clientSocket);
+        clientSocket.on("data", (chunk) => incrementUsage(hostname, "upload", chunk.length));
+        targetSocket.on("data", (chunk) => incrementUsage(hostname, "download", chunk.length));
     });
 
     targetSocket.on("error", (err) => {
