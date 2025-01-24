@@ -1,17 +1,24 @@
-// proxyWorker.js
-var worker_threads = require('worker_threads');
-var cluster = require('cluster');
-var os = require('os');
-var http = require('http');
-var net = require('net');
-var URL = require('url').URL;
+// aggProxyWorker.js
+const http = require('http');
+const net = require('net');
 const { PassThrough } = require('stream');
+const { parentPort, workerData } = require('worker_threads');
+const crypto = require('crypto');
 
-var username, password, remoteProxyUrl, blocklist, auth, remoteProxy;
+// Initialize configurations from workerData
+let portPool = Array.isArray(workerData.portPool) ? workerData.portPool : [];
+const uniqueid = workerData.uniqueid || 'Agg';
+const blocklist = Array.isArray(workerData.blocklist) ? workerData.blocklist : [];
 
-// This object will accumulate data usage per domain in each clustered (child) process.
-var aggregatedUsage = {}; // e.g., { "example.com": { upload: 12345, download: 67890 } }
+// Initialize usage tracking
+const aggregatedUsage = {}; // e.g., { "example.com": { upload: 12345, download: 67890 } }
 
+/**
+ * Increments the usage statistics for a given domain and direction.
+ * @param {string} domain - The domain name.
+ * @param {string} direction - 'upload' or 'download'.
+ * @param {number} numBytes - Number of bytes to increment.
+ */
 function incrementUsage(domain, direction, numBytes) {
     if (!domain) return;
     if (!aggregatedUsage[domain]) {
@@ -20,221 +27,359 @@ function incrementUsage(domain, direction, numBytes) {
     aggregatedUsage[domain][direction] += numBytes;
 }
 
-// Helper to send usage update to the parent process.
+/**
+ * Sends usage updates to the parent process at regular intervals.
+ */
 function sendUsageUpdate() {
     if (Object.keys(aggregatedUsage).length > 0) {
         const update = { type: 'usageUpdate', data: aggregatedUsage };
-        // Send update using process.send (for cluster workers) if available,
-        // otherwise, try worker_threads.parentPort.
-        if (process.send) {
-            process.send(update);
-        } else if (worker_threads.parentPort) {
-            worker_threads.parentPort.postMessage(update);
-        }
-
-        // console.dir(aggregatedUsage)
-        // Reset the aggregation object after sending the update.
-        //aggregatedUsage = {};
+        parentPort.postMessage(update);
+        // Optionally reset the aggregation after sending
+        // Object.keys(aggregatedUsage).forEach(domain => {
+        //     aggregatedUsage[domain].upload = 0;
+        //     aggregatedUsage[domain].download = 0;
+        // });
     }
 }
 
-// Send updates every second.
-setInterval(sendUsageUpdate, 500);
+// Send usage updates every second.
+setInterval(sendUsageUpdate, 1000);
 
-if (cluster.isMaster) {
-    // In the master branch, read configuration from the worker thread’s data.
-    var workerData = worker_threads.workerData;
-    username = workerData.username;
-    password = workerData.password;
-    remoteProxyUrl = workerData.remoteProxyUrl;
-    blocklist = workerData.blocklist; // expected to be an array of lower-case domains
-    auth = "Basic " + Buffer.from(username + ":" + password).toString("base64");
-    remoteProxy = new URL(remoteProxyUrl);
+/**
+ * Mapping table to track active connections per proxy port.
+ * Structure: { proxyPort: activeConnectionCount }
+ */
+const activeConnections = new Map();
+portPool.forEach(port => activeConnections.set(port, 0));
 
-    // Create a temporary server to acquire an ephemeral port.
-    var tempServer = http.createServer();
-    tempServer.listen(0, function () {
-        var port = tempServer.address().port;
-        tempServer.close(function () {
-            // Fork a worker for each CPU core.
-            var numCPUs = 4;
-            for (var i = 0; i < numCPUs; i++) {
-                cluster.fork({
-                    PORT: port,
-                    USERNAME: username,
-                    PASSWORD: password,
-                    REMOTE_PROXY_URL: remoteProxyUrl,
-                    BLOCKLIST: JSON.stringify(blocklist)
-                });
-            }
-            // Notify the parent thread (the Worker that loaded this file) of the port.
-            worker_threads.parentPort.postMessage({ port: port });
-        });
-    });
+/**
+ * Mapping table to track username/password to port assignments.
+ * Structure: { 'username:password': { port: number, timeout: Timeout } }
+ */
+const credentialToPortMap = new Map();
 
-    // Forward usage updates from cluster children to the parent (worker thread)
-    cluster.on('message', (worker, msg) => {
-        if (msg && msg.type === 'usageUpdate') {
-            // Forward the usage update up to the worker thread's parent.
-            if (worker_threads.parentPort) {
-                worker_threads.parentPort.postMessage(msg);
-            }
+/**
+ * Selects an available proxy port not currently assigned to any credentials.
+ * @returns {number|null} - Selected proxy port or null if no ports are available.
+ */
+function selectAvailableProxyPort(bypass) {
+    const assignedPorts = new Set();
+    if (!bypass) {
+        for (const { port } of credentialToPortMap.values()) {
+            assignedPorts.add(port);
         }
-    });
+    }
 
-    cluster.on('exit', function (worker, code, signal) {
-        console.error("[ERROR] Cluster worker " + worker.process.pid + " died with exit code " + code);
-    });
-} else {
-    // In each clustered worker process, read configuration from environment variables.
-    username = process.env.USERNAME;
-    password = process.env.PASSWORD;
-    remoteProxyUrl = process.env.REMOTE_PROXY_URL;
-    blocklist = JSON.parse(process.env.BLOCKLIST || '[]');
-    auth = "Basic " + Buffer.from(username + ":" + password).toString("base64");
-    remoteProxy = new URL(remoteProxyUrl);
 
-    // Create a keep-alive agent for outgoing HTTP requests.
-    var proxyAgent = new http.Agent({
-        keepAlive: true,
-        maxSockets: 100
-    });
+    const availablePorts = portPool.filter(port => !assignedPorts.has(port));
+    if (availablePorts.length === 0) return null;
 
-    // Create the HTTP server that handles regular HTTP proxying.
-    var server = http.createServer(function (clientReq, clientRes) {
-        // For HTTP requests, determine the destination domain.
-        // (Typically provided in the Host header.)
-        var domain = clientReq.headers.host;
+    // Randomly select an available port
+    const randomIndex = Math.floor(Math.random() * availablePorts.length);
+    return availablePorts[randomIndex];
+}
 
-        // Make a shallow copy of the request headers, remove any existing auth info,
-        // and then add our Proxy-Authorization header.
-        var headers = Object.assign({}, clientReq.headers);
-        delete headers.authorization;
-        delete headers.Authorization;
-        headers["Proxy-Authorization"] = auth;
+/**
+ * Assigns a port to the given username/password pair.
+ * @param {string} username - Username.
+ * @param {string} password - Password.
+ * @returns {number|null} - Assigned proxy port or null if no ports are available.
+ */
+function assignPortToCredentials(username, password) {
+    const credentialKey = `${username}:${password}`;
 
-        var options = {
-            hostname: remoteProxy.hostname,
-            port: remoteProxy.port || 80,
-            method: clientReq.method,
-            path: clientReq.url,
-            headers: headers,
-            agent: proxyAgent,
-            timeout: 10000
-        };
+    if (credentialToPortMap.has(credentialKey)) {
+        // Credentials already have an assigned port
+        return credentialToPortMap.get(credentialKey).port;
+    }
 
-        var proxyReq = http.request(options, function (proxyRes) {
-            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+    let bypasslimit = false
+    if (username === 'system') {
+        bypasslimit = true
+    }
 
-            // Create PassThrough streams so we can count the data going downstream.
-            var resCounter = new PassThrough();
-            resCounter.on('data', function (chunk) {
-                incrementUsage(domain, 'download', chunk.length);
-            });
-            // Pipe the response from the remote proxy through our counter and then to the client.
-            proxyRes.pipe(resCounter).pipe(clientRes, { end: true });
+    // Assign a new port
+    const port = selectAvailableProxyPort(bypasslimit);
+    if (!port) return null;
+
+    // Set a timeout to release the mapping after 5 minutes (300,000 ms)
+    const timeout = setTimeout(() => {
+        releasePortFromCredentials(username, password);
+    }, 5 * 60 * 1000); // 5 minutes
+
+    // Store the mapping
+    credentialToPortMap.set(credentialKey, { port, timeout });
+    console.log(`[Worker ${uniqueid}] Assigned port ${port} to credentials ${credentialKey} for 5 minutes`);
+
+    return port;
+}
+
+/**
+ * Releases the port assignment for the given username/password pair.
+ * @param {string} username - Username.
+ * @param {string} password - Password.
+ */
+function releasePortFromCredentials(username, password) {
+    const credentialKey = `${username}:${password}`;
+    const mapping = credentialToPortMap.get(credentialKey);
+
+    if (mapping) {
+        clearTimeout(mapping.timeout);
+        credentialToPortMap.delete(credentialKey);
+        console.log(`[Worker ${uniqueid}] Released port ${mapping.port} from credentials ${credentialKey}`);
+    }
+}
+
+/**
+ * Updates the portPool and resets activeConnections map.
+ * @param {Array<number>} newPortPool - Updated array of proxy ports.
+ */
+function updatePortPool(newPortPool) {
+    portPool = Array.isArray(newPortPool) ? newPortPool : [];
+    activeConnections.clear();
+    portPool.forEach(port => activeConnections.set(port, 0));
+    console.log(`[Worker ${uniqueid}] portPool updated: ${portPool}`);
+}
+
+/**
+ * Handles incoming HTTP requests by routing them to the assigned proxy port based on credentials.
+ */
+const server = http.createServer((clientReq, clientRes) => {
+    // Extract authentication from headers
+    const authHeader = clientReq.headers['authorization'];
+    if (!authHeader || !authHeader.startsWith('Basic ')) {
+        clientRes.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Proxy"' });
+        return clientRes.end('Authentication required.');
+    }
+
+    // Decode Base64 credentials
+    const base64Credentials = authHeader.slice(6).trim();
+    let credentials;
+    try {
+        credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
+    } catch (err) {
+        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
+        return clientRes.end('Invalid Authorization header.');
+    }
+
+    const [username, password] = credentials.split(':');
+    if (!username || !password) {
+        clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
+        return clientRes.end('Invalid credentials format.');
+    }
+
+    // Assign or retrieve the port for these credentials
+    const proxyPort = assignPortToCredentials(username, password);
+
+    if (!proxyPort) {
+        clientRes.writeHead(503, { 'Content-Type': 'text/plain' });
+        return clientRes.end('No available proxy ports.');
+    }
+
+    // Increment the active connection count for the assigned proxy port
+    incrementConnection(proxyPort);
+    console.log(`[Worker ${uniqueid}] Assigned connection to proxy port ${proxyPort} for credentials ${username}:${password}`);
+
+    // Forward the request to the selected local proxy server
+    const options = {
+        hostname: '127.0.0.1',
+        port: proxyPort,
+        path: clientReq.url,
+        method: clientReq.method,
+        headers: clientReq.headers,
+    };
+
+    const proxyReq = http.request(options, (proxyRes) => {
+        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+
+        // PassThrough stream to count download data
+        const resCounter = new PassThrough();
+        resCounter.on('data', (chunk) => {
+            const domain = clientReq.headers.host || 'unknown';
+            incrementUsage(domain, 'download', chunk.length);
         });
 
-        proxyReq.on('error', function (err) {
-            console.error("[ERROR] Proxy request error: " + err.message);
-            if (!clientRes.headersSent) { clientRes.writeHead(500); }
-            clientRes.end("Internal Server Error");
-        });
-
-        proxyReq.on('timeout', function () {
-            console.error("[ERROR] Proxy request timed out");
-            proxyReq.destroy();
-            if (!clientRes.headersSent) { clientRes.writeHead(504); }
-            clientRes.end("Gateway Timeout");
-        });
-
-        // For the upstream (client → proxy) data, use a PassThrough counter.
-        var reqCounter = new PassThrough();
-        reqCounter.on('data', function (chunk) {
-            incrementUsage(domain, 'upload', chunk.length);
-        });
-        clientReq.pipe(reqCounter).pipe(proxyReq, { end: true });
+        proxyRes.pipe(resCounter).pipe(clientRes, { end: true });
     });
 
-    // Handle HTTPS tunneling via CONNECT.
-    server.on('connect', function (req, clientSocket, head) {
-        var parts = req.url.split(":");
-        var destHostname = parts[0];
-        var destPort = parseInt(parts[1], 10) || 443;
+    // PassThrough stream to count upload data
+    const reqCounter = new PassThrough();
+    reqCounter.on('data', (chunk) => {
+        const domain = clientReq.headers.host || 'unknown';
+        incrementUsage(domain, 'upload', chunk.length);
+    });
 
-        if (blocklist.indexOf(destHostname.toLowerCase()) !== -1) {
-            console.warn("[WARN] Blocked CONNECT request for: " + destHostname);
-            clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-            clientSocket.end();
-            return;
+    clientReq.pipe(reqCounter).pipe(proxyReq, { end: true });
+
+    proxyReq.on('error', (err) => {
+        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request error: ${err.message}`);
+        if (!clientRes.headersSent) {
+            clientRes.writeHead(500);
         }
-
-        var proxySocket = net.connect(remoteProxy.port || 80, remoteProxy.hostname, function () {
-            var connectReq = "CONNECT " + destHostname + ":" + destPort + " HTTP/1.1\r\n" +
-                "Host: " + destHostname + ":" + destPort + "\r\n" +
-                "Proxy-Authorization: " + auth + "\r\n" +
-                "\r\n";
-            proxySocket.write(connectReq);
-        });
-
-        proxySocket.setTimeout(10000, function () {
-            //console.error("[ERROR] Proxy socket timeout");
-            proxySocket.destroy();
-            clientSocket.end("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
-        });
-
-        proxySocket.once("data", function (chunk) {
-            var response = chunk.toString();
-            if (response.indexOf("200") === -1) {
-                console.error("[ERROR] Remote proxy CONNECT failed: " + response);
-                clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-                clientSocket.end();
-                proxySocket.end();
-                return;
-            }
-            clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-            if (head && head.length) { proxySocket.write(head); }
-
-            // Instead of directly piping between sockets, we insert PassThrough streams
-            // to count data:
-            var clientToProxy = new PassThrough();
-            var proxyToClient = new PassThrough();
-
-            clientToProxy.on('data', function (chunk) {
-                // Data from client (upload) going to the destination.
-                incrementUsage(destHostname, 'upload', chunk.length);
-            });
-            proxyToClient.on('data', function (chunk) {
-                // Data from destination (download) going to the client.
-                incrementUsage(destHostname, 'download', chunk.length);
-            });
-
-            // Pipe the data between the two sockets via our counter streams.
-            clientSocket.pipe(clientToProxy).pipe(proxySocket);
-            proxySocket.pipe(proxyToClient).pipe(clientSocket);
-        });
-
-        proxySocket.on("error", function (err) {
-            console.error("[ERROR] Proxy socket error: " + err.message);
-            clientSocket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
-            clientSocket.end();
-        });
-
-        clientSocket.on("error", function (err) {
-            console.error("[ERROR] Client socket error: " + err.message);
-            proxySocket.end();
-        });
-
-        clientSocket.on("close", function () { proxySocket.end(); });
-        proxySocket.on("close", function () { clientSocket.end(); });
+        clientRes.end('Internal Server Error');
+        // Decrement the active connection count on error
+        decrementConnection(proxyPort);
     });
 
-    server.on("error", function (err) {
-        console.error("[ERROR] Server error: " + err.message);
+    proxyReq.on('timeout', () => {
+        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request timed out`);
+        proxyReq.destroy();
+        if (!clientRes.headersSent) {
+            clientRes.writeHead(504);
+        }
+        clientRes.end('Gateway Timeout');
+        // Decrement the active connection count on timeout
+        decrementConnection(proxyPort);
     });
 
-    // Each clustered worker listens on the shared port.
-    server.listen(process.env.PORT, function () {
-        console.info("[INFO] Proxy process " + process.pid + " started listening on port " + process.env.PORT);
+    // When the client response finishes, decrement the active connection count
+    clientRes.on('finish', () => {
+        decrementConnection(proxyPort);
+        console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Connection closed`);
     });
+});
+
+/**
+ * Handles HTTPS tunneling via CONNECT method by routing them to the assigned proxy port based on credentials.
+ */
+server.on('connect', (req, clientSocket, head) => {
+    // Extract authentication from headers
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || !authHeader.startsWith('Basic ')) {
+        clientSocket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Proxy\"\r\n\r\n");
+        clientSocket.end('Authentication required.');
+        return;
+    }
+
+    // Decode Base64 credentials
+    const base64Credentials = authHeader.slice(6).trim();
+    let credentials;
+    try {
+        credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
+    } catch (err) {
+        clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+        clientSocket.end('Invalid Authorization header.');
+        return;
+    }
+
+    const [username, password] = credentials.split(':');
+    if (!username || !password) {
+        clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+        clientSocket.end('Invalid credentials format.');
+        return;
+    }
+
+    // Assign or retrieve the port for these credentials
+    const proxyPort = assignPortToCredentials(username, password);
+
+    if (!proxyPort) {
+        clientSocket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        return clientSocket.end('No available proxy ports.');
+    }
+
+    // Increment the active connection count for the assigned proxy port
+    incrementConnection(proxyPort);
+    console.log(`[Worker ${uniqueid}] Assigned CONNECT to proxy port ${proxyPort} for credentials ${username}:${password}`);
+
+    const [destHostname, destPort] = req.url.split(':');
+
+    // Check against the blocklist
+    if (blocklist.map(domain => domain.toLowerCase()).includes(destHostname.toLowerCase())) {
+        console.warn(`[Worker ${uniqueid}] Blocked CONNECT request for: ${destHostname}`);
+        clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+        clientSocket.end();
+        // Decrement the active connection count for blocked requests
+        decrementConnection(proxyPort);
+        return;
+    }
+
+    const proxySocket = net.connect(proxyPort, '127.0.0.1', () => {
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        // Pipe initial data
+        if (head && head.length) proxySocket.write(head);
+        // Pipe data between client and proxy
+        clientSocket.pipe(proxySocket);
+        proxySocket.pipe(clientSocket);
+    });
+
+    // Data counting for CONNECT
+    proxySocket.on('data', (chunk) => {
+        const domain = destHostname || 'unknown';
+        incrementUsage(domain, 'download', chunk.length);
+    });
+
+    clientSocket.on('data', (chunk) => {
+        const domain = destHostname || 'unknown';
+        incrementUsage(domain, 'upload', chunk.length);
+    });
+
+    proxySocket.on('error', (err) => {
+        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy socket error: ${err.message}`);
+        clientSocket.end();
+        // Decrement the active connection count on error
+        decrementConnection(proxyPort);
+    });
+
+    clientSocket.on('error', (err) => {
+        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client socket error: ${err.message}`);
+        proxySocket.end();
+        // Decrement the active connection count on error
+        decrementConnection(proxyPort);
+    });
+
+    // When the connection is closed, decrement the active connection count
+    proxySocket.on('close', () => {
+        decrementConnection(proxyPort);
+        console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] CONNECT connection closed`);
+    });
+
+    clientSocket.on('close', () => {
+        decrementConnection(proxyPort);
+        console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client connection closed`);
+    });
+});
+
+/**
+ * Listens for messages from the main thread to update the portPool.
+ */
+parentPort.on('message', (msg) => {
+    if (msg.type === 'updatePortPool') {
+        if (Array.isArray(msg.portPool)) {
+            updatePortPool(msg.portPool);
+        } else {
+            console.error(`[Worker ${uniqueid}] Invalid portPool received:`, msg.portPool);
+        }
+    }
+    // Handle other message types as needed
+});
+
+// Start the server and listen on the specified port
+const LISTEN_PORT = 8980; // You can adjust this as needed
+server.listen(LISTEN_PORT, () => {
+    console.log(`[Worker ${uniqueid}] Started listening on port ${LISTEN_PORT}`);
+});
+
+/**
+ * Mapping table to track active connections per proxy port.
+ * (Already defined above)
+ */
+
+/**
+ * Functions to manage active connections.
+ */
+function incrementConnection(port) {
+    if (activeConnections.has(port)) {
+        activeConnections.set(port, activeConnections.get(port) + 1);
+    } else {
+        activeConnections.set(port, 1);
+    }
+}
+
+function decrementConnection(port) {
+    if (activeConnections.has(port)) {
+        const current = activeConnections.get(port);
+        if (current > 0) {
+            activeConnections.set(port, current - 1);
+        }
+    }
 }

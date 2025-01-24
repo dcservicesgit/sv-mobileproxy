@@ -2,12 +2,18 @@ const { promisify } = require("util");
 const path = require("path");
 const { Worker } = require("worker_threads");
 
+const logger = (type, message) => {
+    console.log(`[${new Date().toISOString()}][${type.toUpperCase()}] ${message}`)
+}
+
+
 module.exports = {
-    totaldata: 0,
+    totaldata: {
+    },
     proxyservers: {},
 
     LocalProxystartServer: async (outboundIP, uniqueid) => {
-        console.info("[INFO] Booting server");
+        logger('info', "Booting Proxy server");
 
         let blocklist = []; // You can customize the blocklist as needed
 
@@ -28,6 +34,8 @@ module.exports = {
                         worker,
                         port: msg.port,
                     };
+
+                    logger('success', `Worker thread started ${uniqueid} ${msg.port}`);
                     resolve(msg.port);
                 }
             });
@@ -35,22 +43,22 @@ module.exports = {
             // Handle usage updates from the worker
             worker.on("message", (msg) => {
                 if (msg.type === "usageUpdate") {
-                    module.exports.totaldata = 0;
+                    module.exports.totaldata[uniqueid] = 0;
                     module.exports.proxyreport = msg.data;
                     Object.keys(msg.data).forEach((domain) => {
-                        module.exports.totaldata += msg.data[domain].upload + msg.data[domain].download;
+                        module.exports.totaldata[uniqueid] += msg.data[domain].upload + msg.data[domain].download;
                     });
                 }
             });
 
             worker.once("error", (err) => {
-                console.error("[ERROR] Worker thread error:", err.message);
+                logger('error', `AGG Worker thread error: ${err.message}`);
                 reject(err);
             });
 
             worker.once("exit", (code) => {
                 if (code !== 0) {
-                    console.error(`[ERROR] Worker stopped with exit code ${code}`);
+                    logger('error', `AGG Worker stopped with exit code: ${code}`);
                 }
             });
         });
@@ -60,14 +68,16 @@ module.exports = {
     LocalProxycloseServer: (uniqueid) => {
         const serverData = module.exports.proxyservers[uniqueid];
         if (serverData) {
-            console.log(`[INFO] Closing server with unique ID: ${uniqueid} on port ${serverData.port}`);
+
+            logger('info', `Closing server with unique ID: ${uniqueid} on port ${serverData.port}`);
             serverData.worker.postMessage({ type: "terminate" }); // Signal the worker to terminate
             serverData.worker.once("exit", () => {
                 delete module.exports.proxyservers[uniqueid]; // Cleanup
-                console.log(`[INFO] Server with unique ID: ${uniqueid} has been closed.`);
+                logger('info', `Server with unique ID: ${uniqueid} has been closed.`);
+
             });
         } else {
-            console.log(`[WARN] No server found with unique ID: ${uniqueid}`);
+            logger('error', `No server found with unique ID: ${uniqueid}`);
         }
     },
 

@@ -112,6 +112,5 @@ parentPort.on("message", (msg) => {
 // Start the server
 server.listen(0, () => {
     const port = server.address().port;
-    console.info(`[INFO] Worker ${uniqueid} started on port ${port}`);
     parentPort.postMessage({ port });
 });
