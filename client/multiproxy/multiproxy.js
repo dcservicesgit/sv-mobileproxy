@@ -3,8 +3,11 @@
 const si = require('systeminformation');
 
 const chalk = require('chalk')
-const Aggregator = require('./aggregator')
-const proxyManager = require('./proxyManager')
+let Aggregator = require('./aggregator')
+let proxyManager = require('./proxyManager')
+
+let ModemSupport = require('../browser/modemSupport')
+
 const http = require('http');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
@@ -19,7 +22,7 @@ class MultiProxy {
         this.adaptormap = {};
         this.adaptormapConnect = {};
         this.bindPort = 8980
-        this.screenOn = true
+        this.screenOn = false
     }
 
     async startSystem() {
@@ -35,6 +38,7 @@ class MultiProxy {
 
         setInterval(() => {
             this.screen()
+            this.refreshdevices()
         }, 5000)
 
         this.findNetworks()
@@ -321,6 +325,31 @@ class MultiProxy {
             logger('error', chalk.red(`proxy ${proxyPort} Fail ${error.code} ${error.message}`))
 
             return false
+        }
+
+    }
+
+
+    async refreshdevices() {
+        const clearConnections = Object.keys(this.adaptormapConnect);
+
+        for (let index = 0; index < clearConnections.length; index++) {
+            const iface = clearConnections[index];
+            const adaptor = this.adaptormap[iface];
+            const adaptorConnect = this.adaptormapConnect[iface];
+
+            if (!adaptorConnect.last_update) {
+                //make it out of date 
+                adaptorConnect.last_update = new Date(0).toISOString()
+            }
+
+            if (new Date().getTime() < new Date(adaptorConnect).getTime()) {
+
+                //Start reset process
+
+                await ModemSupport.reboot()
+            }
+
         }
 
     }
