@@ -1,7 +1,7 @@
 {
   "dependencies": {
     "chalk": "^4.1.2",
-    "execa": "^9.5.2",
+    "execa": "^4.0.0",
     "systeminformation": "^5.25.11",
     "tree-kill": "^1.2.2",
     "ws": "^8.18.0"
