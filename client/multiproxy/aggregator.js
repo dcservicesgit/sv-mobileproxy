@@ -1,6 +1,7 @@
 // CallingCode.js
+const cluster = require('cluster');
+const os = require('os');
 const path = require('path');
-const { Worker } = require('worker_threads');
 
 const logger = (type, message) => {
     console.log(`[${new Date().toISOString()}][${type.toUpperCase()}] ${message}`);
@@ -12,78 +13,88 @@ module.exports = {
     totaldata: {}, // Stores aggregated data usage
 
     /**
-     * Starts the Aggregator server.
-     * @returns {Promise<number>} - Resolves with the aggregator's listening port.
+     * Starts the Aggregator server with clustering.
+     * @returns {Promise<Array<number>>} - Resolves with the aggregator's listening port(s).
      */
     StartAgg: async () => {
-        logger('info', "Booting Aggregator server");
-        const uniqueid = 'Agg';
-        const blocklist = []; // Customize the blocklist as needed
-
         return new Promise((resolve, reject) => {
-            const worker = new Worker(path.join(__dirname, "aggProxyWorker.js"), {
-                workerData: {
-                    portPool: module.exports.portPool, // Initial portPool
-                    uniqueid,
-                    blocklist,
-                },
-                // Optionally, you can set worker options here
-            });
+            if (cluster.isMaster) {
+                logger('info', "Booting Aggregator server with clustering");
+                const numWorkers = os.cpus().length || 4; // Default to 4 if os.cpus() is undefined
+                const uniqueidBase = 'Agg';
+                const blocklist = []; // Customize the blocklist as needed
 
-            // Listen for messages from the worker
-            worker.on("message", (msg) => {
-                if (msg.type === "usageUpdate") {
-                    // Aggregate usage data
-                    for (const domain in msg.data) {
-                        if (!module.exports.totaldata[uniqueid]) {
-                            module.exports.totaldata[uniqueid] = { upload: 0, download: 0 };
+                // Initialize portPool and other shared resources
+                const portPool = module.exports.portPool;
+                const aggregatedData = module.exports.totaldata;
+
+                // Fork workers
+                for (let i = 0; i < numWorkers; i++) {
+                    const workerEnv = {
+                        UNIQUE_ID: `${uniqueidBase}-${i + 1}`,
+                        PORT_POOL: JSON.stringify(portPool),
+                        BLOCKLIST: JSON.stringify(blocklist),
+                    };
+
+                    const worker = cluster.fork(workerEnv);
+
+                    // Listen for messages from the worker
+                    worker.on('message', (msg) => {
+                        if (msg.type === 'ready') {
+                            const uniqueid = msg.uniqueid;
+                            // Initialize aggregated data for this worker
+                            aggregatedData[uniqueid] = { upload: 0, download: 0 };
+                            // Store worker details
+                            module.exports.proxyservers[uniqueid] = {
+                                worker,
+                                port: 8980, // All workers listen on the same port
+                            };
+                            logger('info', `Worker ${uniqueid} is ready and listening on port 8980.`);
                         }
-                        module.exports.totaldata[uniqueid].upload += msg.data[domain].upload || 0;
-                        module.exports.totaldata[uniqueid].download += msg.data[domain].download || 0;
-                    }
-                    // Optionally, emit or log usage data here
-                    //logger('info', `Aggregated Usage: ${JSON.stringify(module.exports.totaldata[uniqueid])}`);
+
+                        if (msg.type === 'usageUpdate') {
+                            const workerUniqueID = msg.uniqueid;
+                            for (const domain in msg.data) {
+                                if (!aggregatedData[workerUniqueID]) {
+                                    aggregatedData[workerUniqueID] = { upload: 0, download: 0 };
+                                }
+                                aggregatedData[workerUniqueID].upload += msg.data[domain].upload || 0;
+                                aggregatedData[workerUniqueID].download += msg.data[domain].download || 0;
+                            }
+                            // Optionally, emit or log usage data here
+                            // logger('info', `Aggregated Usage for ${workerUniqueID}: ${JSON.stringify(aggregatedData[workerUniqueID])}`);
+                        }
+                    });
+
+                    // Handle worker exit
+                    worker.on('exit', (code, signal) => {
+                        const uniqueid = worker.process.env.UNIQUE_ID;
+                        logger('error', `Worker ${uniqueid} (PID: ${worker.process.pid}) died with code: ${code} and signal: ${signal}`);
+                        logger('info', `Spawning a new worker to replace the dead one.`);
+                        // Remove old worker from proxyservers and aggregatedData
+                        delete module.exports.proxyservers[uniqueid];
+                        delete aggregatedData[uniqueid];
+
+                        // Fork a new worker with the same unique ID
+                        const newWorker = cluster.fork(workerEnv);
+
+                        // The new worker will send a 'ready' message upon initialization
+                    });
                 }
-            });
 
-            // Handle the 'exit' event
-            worker.on("exit", (code) => {
-                if (code !== 0) {
-                    logger('error', `AGG Worker stopped with exit code: ${code}`);
-                    reject(new Error(`Worker stopped with exit code ${code}`));
-                } else {
-                    logger('info', `AGG Worker exited successfully.`);
-                }
-            });
-
-            // Handle errors from the worker
-            worker.on("error", (err) => {
-                logger('error', `AGG Worker thread error: ${err.message}`);
-                reject(err);
-            });
-
-            // Handle successful startup
-            worker.once("online", () => {
-                logger('info', `AGG Worker thread is online.`);
-            });
-
-            // Handle custom messages (e.g., port assignment)
-            // Since in the updated aggProxyWorker.js, the worker listens on port 8980 and doesn't send back port info,
-            // you might want to adjust the worker to send confirmation messages if needed.
-
-            // Store the worker instance for later communication
-            module.exports.proxyservers[uniqueid] = {
-                worker,
-                port: 8980, // Assuming the aggregator listens on this port
-            };
-
-            // Resolve immediately since the worker listens on a fixed port
-            resolve(8980);
+                // Optionally, resolve once all workers have sent 'ready' messages
+                // For simplicity, resolve immediately since workers share the same port
+                logger('info', `Aggregator is listening on port(s): 8980`);
+                resolve([8980]); // Array of listening ports for consistency
+            } else {
+                // Worker process
+                require('./aggProxyWorker.js');
+            }
         });
     },
 
     /**
-     * Updates the portPool and notifies the worker.
+     * Updates the portPool and notifies all workers.
      * @param {Array<number>} newPortPool - Updated array of proxy server ports.
      */
     updatePortPool: (newPortPool) => {
@@ -91,9 +102,8 @@ module.exports = {
 
         // Notify all running workers about the portPool update
         Object.values(module.exports.proxyservers).forEach(({ worker }) => {
-            if (worker && worker.postMessage) {
-
-                worker.postMessage({
+            if (worker && worker.send) {
+                worker.send({
                     type: 'updatePortPool',
                     portPool: newPortPool,
                 });

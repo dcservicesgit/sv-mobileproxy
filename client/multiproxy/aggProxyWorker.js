@@ -2,24 +2,25 @@
 const http = require('http');
 const net = require('net');
 const { PassThrough } = require('stream');
-const { parentPort, workerData } = require('worker_threads');
 const crypto = require('crypto');
 const chalk = require('chalk');
 
-// Initialize configurations from workerData
-let portPool = Array.isArray(workerData.portPool) ? workerData.portPool : [];
-const uniqueid = workerData.uniqueid || 'Agg';
-const blocklist = Array.isArray(workerData.blocklist) ? workerData.blocklist : [];
+// Initialize configurations from environment variables or process arguments
+const uniqueid = process.env.UNIQUE_ID || `Worker-${process.pid}`;
+const blocklist = process.env.BLOCKLIST ? JSON.parse(process.env.BLOCKLIST) : [];
+
+// Send UNIQUE_ID to master process once the worker is ready
+process.send({ type: 'ready', uniqueid });
 
 // Global error handlers to prevent worker from crashing
 process.on('uncaughtException', (err) => {
-    console.error(`[Worker ${uniqueid}] Uncaught Exception: ${err.stack || err}`);
+    console.error(`[${uniqueid}] Uncaught Exception: ${err.stack || err}`);
     // Optionally, you can exit or attempt to recover
     // process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error(`[Worker ${uniqueid}] Unhandled Rejection at:`, promise, 'reason:', reason);
+    console.error(`[${uniqueid}] Unhandled Rejection at:`, promise, 'reason:', reason);
     // Optionally, you can exit or attempt to recover
     // process.exit(1);
 });
@@ -42,12 +43,12 @@ function incrementUsage(domain, direction, numBytes) {
 }
 
 /**
- * Sends usage updates to the parent process at regular intervals.
+ * Sends usage updates to the master process at regular intervals.
  */
 function sendUsageUpdate() {
     if (Object.keys(aggregatedUsage).length > 0) {
         const update = { type: 'usageUpdate', data: aggregatedUsage };
-        parentPort.postMessage(update);
+        process.send(update);
         // Optionally reset the aggregation after sending
         // Object.keys(aggregatedUsage).forEach(domain => {
         //     aggregatedUsage[domain].upload = 0;
@@ -57,12 +58,13 @@ function sendUsageUpdate() {
 }
 
 // Send usage updates every second.
-//setInterval(sendUsageUpdate, 1000);
+setInterval(sendUsageUpdate, 1000);
 
 /**
- * Mapping table to track active connections per proxy port.
- * Structure: { proxyPort: activeConnectionCount }
+ * Port Pool and Connection Management
+ * These will be managed per worker.
  */
+let portPool = process.env.PORT_POOL ? JSON.parse(process.env.PORT_POOL) : [];
 const activeConnections = new Map();
 portPool.forEach(port => activeConnections.set(port, 0));
 
@@ -86,14 +88,14 @@ function selectAvailableProxyPort(bypass) {
     }
 
     const availablePorts = portPool.filter(port => !assignedPorts.has(port));
-    console.log(`[Worker ${uniqueid}] Available ports for assignment: ${availablePorts.join(', ')}`);
+    console.log(`[${uniqueid}] Available ports for assignment: ${availablePorts.join(', ')}`);
 
     if (availablePorts.length === 0) return null;
 
     // Randomly select an available port
     const randomIndex = Math.floor(Math.random() * availablePorts.length);
     const selectedPort = availablePorts[randomIndex];
-    console.log(`[Worker ${uniqueid}] Selected available port ${selectedPort} for new credentials.`);
+    console.log(`[${uniqueid}] Selected available port ${selectedPort} for new credentials.`);
     return selectedPort;
 }
 
@@ -109,7 +111,6 @@ function assignPortToCredentials(username, password) {
     if (credentialToPortMap.has(credentialKey)) {
         // Credentials already have an assigned port
         const existingPort = credentialToPortMap.get(credentialKey).port;
-        //console.log(`[Worker ${uniqueid}] Retrieved existing port ${existingPort} for credentials ${credentialKey}`);
         return existingPort;
     }
 
@@ -121,7 +122,7 @@ function assignPortToCredentials(username, password) {
     // Assign a new port
     const port = selectAvailableProxyPort(bypasslimit);
     if (!port) {
-        console.warn(`[Worker ${uniqueid}] No available ports to assign for credentials ${credentialKey}`);
+        console.warn(`[${uniqueid}] No available ports to assign for credentials ${credentialKey}`);
         return null;
     }
 
@@ -131,13 +132,13 @@ function assignPortToCredentials(username, password) {
     }, 5 * 60 * 1000); // 5 minutes
 
     if (bypasslimit) {
-        console.log(`[Worker ${uniqueid}] Bypass limit for credentials ${credentialKey}. Assigned port ${port} without mapping.`);
+        console.log(`[${uniqueid}] Bypass limit for credentials ${credentialKey}. Assigned port ${port} without mapping.`);
         return port;
     }
 
     // Store the mapping
     credentialToPortMap.set(credentialKey, { port, timeout });
-    console.log(`[Worker ${uniqueid}] Assigned port ${port} to credentials ${credentialKey} for 5 minutes`);
+    console.log(`[${uniqueid}] Assigned port ${port} to credentials ${credentialKey} for 5 minutes`);
 
     return port;
 }
@@ -154,7 +155,7 @@ function releasePortFromCredentials(username, password) {
     if (mapping) {
         clearTimeout(mapping.timeout);
         credentialToPortMap.delete(credentialKey);
-        console.log(`[Worker ${uniqueid}] Released port ${mapping.port} from credentials ${credentialKey}`);
+        console.log(`[${uniqueid}] Released port ${mapping.port} from credentials ${credentialKey}`);
     }
 }
 
@@ -166,14 +167,13 @@ function updatePortPool(newPortPool) {
     portPool = Array.isArray(newPortPool) ? newPortPool : [];
     activeConnections.clear();
     portPool.forEach(port => activeConnections.set(port, 0));
-    console.log(`[Worker ${uniqueid}] portPool updated: ${portPool}`);
+    console.log(`[${uniqueid}] portPool updated: ${portPool}`);
 }
 
 /**
  * Handles incoming HTTP requests by routing them to the assigned proxy port based on credentials.
  */
 const server = http.createServer((clientReq, clientRes) => {
-    // Extract authentication from headers
     // Extract Proxy-Authorization from headers
     const authHeader = clientReq.headers['proxy-authorization'];
     if (!authHeader || !authHeader.startsWith('Basic ')) {
@@ -194,14 +194,14 @@ const server = http.createServer((clientReq, clientRes) => {
     try {
         credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
     } catch (err) {
-        console.error(`[Worker ${uniqueid}] Error decoding credentials: ${err.message}`);
+        console.error(`[${uniqueid}] Error decoding credentials: ${err.message}`);
         clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
         return clientRes.end('Invalid Authorization header.');
     }
 
     const [username, password] = credentials.split(':');
     if (!username || !password) {
-        console.error(`[Worker ${uniqueid}] Invalid credentials format.`);
+        console.error(`[${uniqueid}] Invalid credentials format.`);
         clientRes.writeHead(400, { 'Content-Type': 'text/plain' });
         return clientRes.end('Invalid credentials format.');
     }
@@ -216,7 +216,7 @@ const server = http.createServer((clientReq, clientRes) => {
 
     // Increment the active connection count for the assigned proxy port
     incrementConnection(proxyPort);
-    console.log(`[Worker ${uniqueid}] Assigned connection to proxy port ${proxyPort} for credentials ${username}:${password}`);
+    console.log(`[${uniqueid}] Assigned connection to proxy port ${proxyPort} for credentials ${username}:${password}`);
 
     // Forward the request to the selected local proxy server
     const options = {
@@ -242,7 +242,7 @@ const server = http.createServer((clientReq, clientRes) => {
 
     // Attach error handler before piping
     proxyReq.on('error', (err) => {
-        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request error: ${err.stack || err.message}`);
+        console.error(`[${uniqueid}][Proxy Port ${proxyPort}] Proxy request error: ${err.stack || err.message}`);
         if (!clientRes.headersSent) {
             clientRes.writeHead(500);
         }
@@ -262,7 +262,7 @@ const server = http.createServer((clientReq, clientRes) => {
 
     // Handle timeout
     proxyReq.on('timeout', () => {
-        console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Proxy request timed out`);
+        console.error(`[${uniqueid}][Proxy Port ${proxyPort}] Proxy request timed out`);
         proxyReq.destroy();
         if (!clientRes.headersSent) {
             clientRes.writeHead(504);
@@ -275,7 +275,7 @@ const server = http.createServer((clientReq, clientRes) => {
     // When the client response finishes, decrement the active connection count
     clientRes.on('finish', () => {
         decrementConnection(proxyPort);
-        console.log(`[Worker ${uniqueid}] Connection to proxy port ${proxyPort} closed.`);
+        console.log(`[${uniqueid}] Connection to proxy port ${proxyPort} closed.`);
     });
 });
 
@@ -284,7 +284,7 @@ const server = http.createServer((clientReq, clientRes) => {
  */
 server.on('connect', (req, clientSocket, head) => {
     // Log the start of the CONNECT handler
-    console.log(`[Worker ${uniqueid}] Received CONNECT request for: ${chalk.blue(req.url)}`);
+    console.log(`[${uniqueid}] Received CONNECT request for: ${chalk.blue(req.url)}`);
 
     // Extract Proxy-Authorization from headers
     const proxyAuthHeader = req.headers['proxy-authorization'];
@@ -292,8 +292,7 @@ server.on('connect', (req, clientSocket, head) => {
         // Respond with 407 Proxy Authentication Required
         clientSocket.write(
             "HTTP/1.1 407 Proxy Authentication Required\r\n" +
-            "Proxy-Authenticate: Basic realm=\"Proxy\"\r\n" +
-            "\r\n"
+            "Proxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"
         );
         clientSocket.end('Proxy authentication required.');
         return;
@@ -327,13 +326,12 @@ server.on('connect', (req, clientSocket, head) => {
 
     // Increment the active connection count for the assigned proxy port
     incrementConnection(proxyPort);
-    //console.log(`[Worker ${uniqueid}] Assigned CONNECT to proxy port ${proxyPort} for credentials ${username}:${password}`);
 
     const [destHostname, destPort] = req.url.split(':');
 
     // Check against the blocklist
     if (blocklist.map(domain => domain.toLowerCase()).includes(destHostname.toLowerCase())) {
-        console.warn(`[Worker ${uniqueid}] Blocked CONNECT request for: ${destHostname}`);
+        console.warn(`[${uniqueid}] Blocked CONNECT request for: ${destHostname}`);
         clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
         clientSocket.end();
         // Decrement the active connection count for blocked requests
@@ -343,7 +341,6 @@ server.on('connect', (req, clientSocket, head) => {
 
     // Establish a connection to the downstream proxy using net.connect
     const downstreamSocket = net.connect(proxyPort, '127.0.0.1', () => {
-        //console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Connected to downstream proxy.`);
         // Send the CONNECT request to the downstream proxy
         downstreamSocket.write(`CONNECT ${req.url} HTTP/1.1\r\nHost: ${req.url}\r\n\r\n`);
     });
@@ -354,8 +351,6 @@ server.on('connect', (req, clientSocket, head) => {
         const [statusLine] = response.split('\r\n');
         const [httpVersion, statusCode, ...statusMessageParts] = statusLine.split(' ');
         const statusMessage = statusMessageParts.join(' ');
-
-        //console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Downstream proxy responded with: ${statusCode} ${statusMessage}`);
 
         if (statusCode === '200') {
             // Connection established
@@ -375,7 +370,7 @@ server.on('connect', (req, clientSocket, head) => {
                 incrementUsage(domain, 'upload', chunk.length);
             });
         } else {
-            console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] CONNECT request failed with status code: ${statusCode}`);
+            console.error(`[${uniqueid}][Proxy Port ${proxyPort}] CONNECT request failed with status code: ${statusCode}`);
             clientSocket.write(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n\r\n`);
             clientSocket.end(`Connection failed with status code: ${statusCode}`);
             downstreamSocket.end();
@@ -385,7 +380,6 @@ server.on('connect', (req, clientSocket, head) => {
 
     // Handle errors on downstream socket
     downstreamSocket.on('error', (err) => {
-        //console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Downstream socket error: ${err.message}`);
         clientSocket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
         clientSocket.end('Internal Server Error');
         decrementConnection(proxyPort);
@@ -393,7 +387,6 @@ server.on('connect', (req, clientSocket, head) => {
 
     // Handle client socket errors
     clientSocket.on('error', (err) => {
-        //console.error(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client socket error: ${err.message}`);
         downstreamSocket.end();
         decrementConnection(proxyPort);
     });
@@ -401,38 +394,12 @@ server.on('connect', (req, clientSocket, head) => {
     // Handle downstream socket closure
     downstreamSocket.on('close', () => {
         decrementConnection(proxyPort);
-        //console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] CONNECT connection closed.`);
     });
 
     // Handle client socket closure
     clientSocket.on('close', () => {
         decrementConnection(proxyPort);
-        //console.log(`[Worker ${uniqueid}][Proxy Port ${proxyPort}] Client connection closed.`);
     });
-});
-
-
-
-
-
-/**
- * Listens for messages from the main thread to update the portPool.
- */
-parentPort.on('message', (msg) => {
-    if (msg.type === 'updatePortPool') {
-        if (Array.isArray(msg.portPool)) {
-            updatePortPool(msg.portPool);
-        } else {
-            console.error(`[Worker ${uniqueid}] Invalid portPool received:`, msg.portPool);
-        }
-    }
-    // Handle other message types as needed
-});
-
-// Start the server and listen on the specified port
-const LISTEN_PORT = 8980; // You can adjust this as needed
-server.listen(LISTEN_PORT, () => {
-    console.log(`[Worker ${uniqueid}] Started listening on port ${LISTEN_PORT}`);
 });
 
 /**
@@ -454,3 +421,23 @@ function decrementConnection(port) {
         }
     }
 }
+
+/**
+ * Listens for messages from the master process to update the portPool.
+ */
+process.on('message', (msg) => {
+    if (msg.type === 'updatePortPool') {
+        if (Array.isArray(msg.portPool)) {
+            updatePortPool(msg.portPool);
+        } else {
+            console.error(`[${uniqueid}] Invalid portPool received:`, msg.portPool);
+        }
+    }
+    // Handle other message types as needed
+});
+
+// Start the server and listen on the specified port
+const LISTEN_PORT = 8980; // All workers share this port via cluster
+server.listen(LISTEN_PORT, () => {
+    console.log(`[${uniqueid}] Started listening on port ${LISTEN_PORT}`);
+});
