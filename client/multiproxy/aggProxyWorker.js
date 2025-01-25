@@ -5,12 +5,14 @@ const { PassThrough } = require('stream');
 const crypto = require('crypto');
 const chalk = require('chalk');
 
-// Initialize configurations from environment variables or process arguments
+// Initialize configurations from environment variables
 const uniqueid = process.env.UNIQUE_ID || `Worker-${process.pid}`;
 const blocklist = process.env.BLOCKLIST ? JSON.parse(process.env.BLOCKLIST) : [];
 
 // Send UNIQUE_ID to master process once the worker is ready
-process.send({ type: 'ready', uniqueid });
+if (process.send) {
+    process.send({ type: 'ready', uniqueid });
+}
 
 // Global error handlers to prevent worker from crashing
 process.on('uncaughtException', (err) => {
@@ -47,8 +49,10 @@ function incrementUsage(domain, direction, numBytes) {
  */
 function sendUsageUpdate() {
     if (Object.keys(aggregatedUsage).length > 0) {
-        const update = { type: 'usageUpdate', data: aggregatedUsage };
-        process.send(update);
+        const update = { type: 'usageUpdate', uniqueid, data: aggregatedUsage };
+        if (process.send) {
+            process.send(update);
+        }
         // Optionally reset the aggregation after sending
         // Object.keys(aggregatedUsage).forEach(domain => {
         //     aggregatedUsage[domain].upload = 0;
@@ -62,7 +66,7 @@ setInterval(sendUsageUpdate, 1000);
 
 /**
  * Port Pool and Connection Management
- * These will be managed per worker.
+ * Managed per worker.
  */
 let portPool = process.env.PORT_POOL ? JSON.parse(process.env.PORT_POOL) : [];
 const activeConnections = new Map();

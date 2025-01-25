@@ -23,6 +23,8 @@ class MultiProxy {
         this.adaptormapConnect = {};
         this.bindPort = 8980
         this.screenOn = false
+
+        this.aggbooted = false
     }
 
     async startSystem() {
@@ -44,9 +46,9 @@ class MultiProxy {
         this.findNetworks()
         this.screen()
 
-        await Aggregator.StartAgg()
 
-        setInterval(() => {
+
+        setInterval(async () => {
             let ports = []
             Object.keys(this.adaptormapConnect).forEach((adapterkey) => {
                 let adaptor = this.adaptormapConnect[adapterkey]
@@ -56,12 +58,23 @@ class MultiProxy {
             })
 
             if (ports.length > 0) {
-                if (JSON.stringify(Aggregator.portPool) !== JSON.stringify(ports)) {
+
+                if (this.aggbooted) {
+                    if (JSON.stringify(Aggregator.portPool) !== JSON.stringify(ports)) {
+                        Aggregator.updatePortPool(ports)
+                    }
+                }
+                else {
+                    logger(`info`, 'starting boot of Agg')
+                    console.dir(ports)
+                    this.aggbooted = true
+                    Aggregator.portPool = ports
+                    await Aggregator.StartAgg()
                     Aggregator.updatePortPool(ports)
                 }
-            }
 
-        }, 2000)
+            }
+        }, 5000)
 
 
         setInterval(async () => {
@@ -78,7 +91,7 @@ class MultiProxy {
                 console.error('Proxy endpoint check failed. Taking corrective action...');
                 // Add your failure handling logic here
 
-                Aggregator.portPool = []
+                //Aggregator.portPool = []
             }
         }, 10000);
     }

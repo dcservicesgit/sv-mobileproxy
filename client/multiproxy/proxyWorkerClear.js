@@ -3,14 +3,20 @@ const http = require("http");
 const net = require("net");
 const { PassThrough } = require("stream");
 
+/**
+ * Simple logger function for workers.
+ * @param {string} type - The type of log (info, error, etc.).
+ * @param {string} message - The log message.
+ */
+const logger = (type, message) => {
+    console.log(`[Worker ${process.env.UNIQUE_ID}][${type.toUpperCase()}] ${message}`);
+};
+
 // Retrieve configuration from environment variables
 const outboundIP = process.env.OUTBOUND_IP;
 const uniqueid = process.env.UNIQUE_ID;
 const blocklist = JSON.parse(process.env.BLOCKLIST || "[]");
-
-const logger = (type, message) => {
-    console.log(`[Worker ${uniqueid}][${type.toUpperCase()}] ${message}`);
-};
+const port = parseInt(process.env.PORT, 10);
 
 let aggregatedUsage = {}; // Tracks data usage
 
@@ -25,6 +31,12 @@ process.on('unhandledRejection', (reason, promise) => {
     process.exit(1); // Exit to allow master to handle respawning if necessary
 });
 
+/**
+ * Increments usage statistics for a given domain and direction.
+ * @param {string} domain - The domain being accessed.
+ * @param {string} direction - 'upload' or 'download'.
+ * @param {number} numBytes - The number of bytes transferred.
+ */
 function incrementUsage(domain, direction, numBytes) {
     if (!domain) return;
     if (!aggregatedUsage[domain]) {
@@ -37,6 +49,8 @@ function incrementUsage(domain, direction, numBytes) {
 setInterval(() => {
     if (Object.keys(aggregatedUsage).length > 0) {
         process.send({ type: "usageUpdate", data: aggregatedUsage });
+        // Optionally, reset aggregatedUsage if needed
+        // aggregatedUsage = {};
     }
 }, 1000);
 
@@ -130,7 +144,7 @@ process.on("message", (msg) => {
 });
 
 // Start the server
-server.listen(0, () => {
-    const port = server.address().port;
+server.listen(port, '0.0.0.0', () => {
+    logger('info', `Proxy server listening on port ${port}`);
     process.send({ type: "initialized", port });
 });

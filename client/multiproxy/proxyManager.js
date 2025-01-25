@@ -1,95 +1,150 @@
 // ProxyManager.js
-const cluster = require("cluster");
-const path = require("path");
-const os = require("os");
+const cluster = require('cluster');
+const path = require('path');
+const os = require('os');
+const net = require('net');
 
 const logger = (type, message) => {
     console.log(`[${new Date().toISOString()}][${type.toUpperCase()}] ${message}`);
 };
 
-// Maintain the original module.exports structure
+// Default number of workers per proxy server
+const DEFAULT_WORKER_COUNT = os.cpus().length; // Utilize all available CPU cores
+
 module.exports = {
     totaldata: {},
     proxyservers: {},
 
-    LocalProxystartServer: async (outboundIP, uniqueid, blocklist = []) => {
+    /**
+     * Starts a new proxy server with multiple workers.
+     * @param {string} outboundIP - The outbound IP address for the proxy.
+     * @param {string} uniqueid - A unique identifier for the proxy server.
+     * @param {Array<string>} blocklist - An array of domains to block.
+     * @param {number} workerCount - Number of workers to spawn (optional).
+     * @param {number} port - The port number for the proxy server (optional).
+     * @returns {Promise<number>} - Resolves with the port number the proxy server is running on.
+     */
+    LocalProxystartServer: async (outboundIP, uniqueid, blocklist = [], workerCount = DEFAULT_WORKER_COUNT, port = null) => {
         if (cluster.isMaster) {
-            logger('info', "Booting Proxy server using Cluster");
+            logger('info', `Booting Proxy server '${uniqueid}' using Cluster`);
+
+            // Assign a port if not provided
+            if (!port) {
+                port = await findAvailablePort(8000, 9000);
+                if (!port) {
+                    throw new Error('No available ports found for the proxy server.');
+                }
+            }
+
+            module.exports.proxyservers[uniqueid] = {
+                port,
+                workers: [],
+            };
 
             return new Promise((resolve, reject) => {
-                // Fork a new worker with environment variables
-                const worker = cluster.fork({
-                    OUTBOUND_IP: outboundIP,
-                    UNIQUE_ID: uniqueid,
-                    BLOCKLIST: JSON.stringify(blocklist),
+                // Set the worker script
+                cluster.setupMaster({
+                    exec: path.join(__dirname, 'proxyWorkerClear.js'),
+                    args: [], // Add any arguments if necessary
                 });
 
-                // Handler for messages from the worker
-                const messageHandler = (msg) => {
-                    if (msg.type === "initialized") {
-                        module.exports.proxyservers[uniqueid] = {
-                            worker,
-                            port: msg.port,
-                        };
+                // Fork the specified number of workers
+                for (let i = 0; i < workerCount; i++) {
+                    const worker = cluster.fork({
+                        OUTBOUND_IP: outboundIP,
+                        UNIQUE_ID: uniqueid,
+                        BLOCKLIST: JSON.stringify(blocklist),
+                        PORT: port,
+                    });
 
-                        logger('success', `Worker process started ${uniqueid} on port ${msg.port}`);
-                        resolve(msg.port);
-                    } else if (msg.type === "usageUpdate") {
-                        module.exports.totaldata[uniqueid] = 0;
-                        module.exports.proxyreport = msg.data;
-                        Object.keys(msg.data).forEach((domain) => {
-                            module.exports.totaldata[uniqueid] += msg.data[domain].upload + msg.data[domain].download;
+                    // Listen for messages from the worker
+                    worker.on('message', (msg) => {
+                        if (msg.type === 'initialized') {
+                            logger('success', `Worker ${worker.process.pid} initialized for '${uniqueid}' on port ${port}`);
+                        } else if (msg.type === 'usageUpdate') {
+                            if (!module.exports.totaldata[uniqueid]) {
+                                module.exports.totaldata[uniqueid] = 0;
+                            }
+                            Object.keys(msg.data).forEach((domain) => {
+                                module.exports.totaldata[uniqueid] += msg.data[domain].upload + msg.data[domain].download;
+                            });
+                            // Optionally, handle or emit proxy report here
+                        }
+                    });
+
+                    // Handle worker exit
+                    worker.on('exit', (code, signal) => {
+                        logger('error', `Worker ${worker.process.pid} for '${uniqueid}' exited with code ${code} and signal ${signal}`);
+                        // Remove the worker from the list
+                        module.exports.proxyservers[uniqueid].workers = module.exports.proxyservers[uniqueid].workers.filter(w => w.id !== worker.id);
+                        // Respawn the worker
+                        const respawnedWorker = cluster.fork({
+                            OUTBOUND_IP: outboundIP,
+                            UNIQUE_ID: uniqueid,
+                            BLOCKLIST: JSON.stringify(blocklist),
+                            PORT: port,
                         });
-                    }
-                };
+                        module.exports.proxyservers[uniqueid].workers.push(respawnedWorker);
+                        logger('info', `Respawned Worker ${respawnedWorker.process.pid} for '${uniqueid}'`);
+                    });
 
-                // Listen for messages from the worker
-                worker.on("message", messageHandler);
+                    // Handle worker errors
+                    worker.on('error', (err) => {
+                        logger('error', `Worker ${worker.process.pid} for '${uniqueid}' encountered error: ${err.message}`);
+                        // Remove the worker from the list
+                        module.exports.proxyservers[uniqueid].workers = module.exports.proxyservers[uniqueid].workers.filter(w => w.id !== worker.id);
+                        reject(err);
+                    });
 
-                // Handle worker exit
-                worker.on("exit", (code, signal) => {
-                    logger('error', `Worker for ${uniqueid} exited with code ${code} and signal ${signal}`);
-                    delete module.exports.proxyservers[uniqueid];
-                });
+                    // Add worker to the list
+                    module.exports.proxyservers[uniqueid].workers.push(worker);
+                }
 
-                // Handle worker errors
-                worker.on("error", (err) => {
-                    logger('error', `Worker for ${uniqueid} encountered error: ${err.message}`);
-                    delete module.exports.proxyservers[uniqueid];
-                    reject(err);
-                });
+                resolve(port);
             });
         } else {
-            // In worker process, do nothing. The worker script will handle itself.
+            // In worker process, do nothing. The worker script handles itself.
             return;
         }
     },
 
-    // Function to close a server and release its resources
-    LocalProxycloseServer: (uniqueid) => {
+    /**
+     * Closes an existing proxy server and all its workers.
+     * @param {string} uniqueid - The unique identifier of the proxy server to close.
+     * @returns {Promise<void>}
+     */
+    LocalProxycloseServer: async (uniqueid) => {
         if (cluster.isMaster) {
             const serverData = module.exports.proxyservers[uniqueid];
             if (serverData) {
-                logger('info', `Closing server with unique ID: ${uniqueid} on port ${serverData.port}`);
-                serverData.worker.send({ type: "terminate" }); // Signal the worker to terminate
+                logger('info', `Closing server '${uniqueid}' on port ${serverData.port}`);
+                const workers = serverData.workers.slice(); // Clone the array to prevent modification during iteration
 
-                return new Promise((resolve, reject) => {
-                    serverData.worker.once("exit", () => {
-                        delete module.exports.proxyservers[uniqueid]; // Cleanup
-                        logger('info', `Server with unique ID: ${uniqueid} has been closed.`);
-                        resolve();
+                return Promise.all(workers.map(worker => {
+                    return new Promise((resolve, reject) => {
+                        worker.send({ type: 'terminate' });
+
+                        worker.once('exit', () => {
+                            logger('info', `Worker ${worker.process.pid} for '${uniqueid}' has been closed.`);
+                            resolve();
+                        });
+
+                        // Optional: Timeout in case worker doesn't exit
+                        setTimeout(() => {
+                            logger('error', `Timeout while closing Worker ${worker.process.pid} for '${uniqueid}'`);
+                            reject(new Error("Timeout while closing worker."));
+                        }, 5000);
                     });
-
-                    // Optional: Timeout in case worker doesn't exit
-                    setTimeout(() => {
-                        logger('error', `Timeout while closing server with unique ID: ${uniqueid}`);
-                        reject(new Error("Timeout while closing server."));
-                    }, 5000);
+                })).then(() => {
+                    delete module.exports.proxyservers[uniqueid];
+                    logger('info', `Server '${uniqueid}' has been fully closed.`);
+                }).catch(err => {
+                    logger('error', `Error while closing server '${uniqueid}': ${err.message}`);
                 });
             } else {
-                const errorMsg = `No server found with unique ID: ${uniqueid}`;
+                const errorMsg = `No server found with unique ID: '${uniqueid}'`;
                 logger('error', errorMsg);
-                return Promise.reject(new Error(errorMsg));
+                throw new Error(errorMsg);
             }
         } else {
             // In worker process, do nothing
@@ -97,16 +152,26 @@ module.exports = {
         }
     },
 
-    // Function to reconfigure a server with new parameters
+    /**
+     * Reconfigures an existing proxy server with new parameters.
+     * @param {string} uniqueid - The unique identifier of the proxy server to reconfigure.
+     * @param {Object} newConfig - The new configuration parameters.
+     * @param {string} newConfig.outboundIP - The new outbound IP address.
+     * @param {Array<string>} newConfig.blocklist - The new blocklist.
+     * @param {number} newConfig.workerCount - Number of workers to spawn (optional).
+     * @param {number} newConfig.port - The new port number for the proxy server (optional).
+     * @returns {Promise<number>} - Resolves with the new port number.
+     */
     LocalProxyreconfigureServer: async (uniqueid, newConfig) => {
         if (cluster.isMaster) {
-            logger("info", `[INFO] Reconfiguring server with unique ID: ${uniqueid}`);
+            logger("info", `Reconfiguring server '${uniqueid}'`);
+
             // Close the existing server
             await module.exports.LocalProxycloseServer(uniqueid);
 
             // Start a new server with the updated configuration
-            const { outboundIP, blocklist } = newConfig;
-            return module.exports.LocalProxystartServer(outboundIP, uniqueid, blocklist);
+            const { outboundIP, blocklist, workerCount, port } = newConfig;
+            return module.exports.LocalProxystartServer(outboundIP, uniqueid, blocklist, workerCount, port);
         } else {
             // In worker process, do nothing
             return;
@@ -114,8 +179,39 @@ module.exports = {
     },
 };
 
-// If the current process is a worker, run the worker script
-if (!cluster.isMaster) {
-    // Require the worker script
-    require(path.join(__dirname, "proxyWorkerClear.js"));
+// Handle worker exits and optionally respawn if necessary
+if (cluster.isMaster) {
+    cluster.on('exit', (worker, code, signal) => {
+        logger('error', `Worker process ${worker.process.pid} died with code ${code} and signal ${signal}`);
+        // Optionally, implement worker respawning logic here
+    });
 }
+
+/**
+ * Finds an available port within the specified range.
+ * @param {number} startPort - The starting port number.
+ * @param {number} endPort - The ending port number.
+ * @returns {Promise<number|null>} - Resolves with an available port or null if none found.
+ */
+const findAvailablePort = (startPort, endPort) => {
+    return new Promise((resolve) => {
+        const tryPort = (port) => {
+            if (port > endPort) {
+                resolve(null);
+                return;
+            }
+
+            const server = net.createServer()
+                .once('error', () => {
+                    tryPort(port + 1);
+                })
+                .once('listening', () => {
+                    server.close();
+                    resolve(port);
+                })
+                .listen(port, '0.0.0.0');
+        };
+
+        tryPort(startPort);
+    });
+};
