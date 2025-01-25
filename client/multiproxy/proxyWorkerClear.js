@@ -1,23 +1,28 @@
-//ProxyWorkerClear.js
-const { workerData, parentPort } = require("worker_threads");
+// proxyWorkerClear.js
 const http = require("http");
 const net = require("net");
 const { PassThrough } = require("stream");
 
-let { outboundIP, uniqueid, blocklist } = workerData;
+// Retrieve configuration from environment variables
+const outboundIP = process.env.OUTBOUND_IP;
+const uniqueid = process.env.UNIQUE_ID;
+const blocklist = JSON.parse(process.env.BLOCKLIST || "[]");
+
+const logger = (type, message) => {
+    console.log(`[Worker ${uniqueid}][${type.toUpperCase()}] ${message}`);
+};
+
 let aggregatedUsage = {}; // Tracks data usage
 
-// Add at the top of your aggProxyWorker.js
+// Error Handling
 process.on('uncaughtException', (err) => {
-    console.error(`[Worker ${uniqueid}] Uncaught Exception: ${err.stack || err}`);
-    // Decide whether to exit or attempt recovery
-    // process.exit(1); // Optional: Exit the process
+    logger("error", `Uncaught Exception: ${err.stack || err}`);
+    process.exit(1); // Exit to allow master to handle respawning if necessary
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error(`[Worker ${uniqueid}] Unhandled Rejection at:`, promise, 'reason:', reason);
-    // Decide whether to exit or attempt recovery
-    // process.exit(1); // Optional: Exit the process
+    logger("error", `Unhandled Rejection at: ${promise} reason: ${reason}`);
+    process.exit(1); // Exit to allow master to handle respawning if necessary
 });
 
 function incrementUsage(domain, direction, numBytes) {
@@ -28,10 +33,10 @@ function incrementUsage(domain, direction, numBytes) {
     aggregatedUsage[domain][direction] += numBytes;
 }
 
-// Periodically send usage updates to the parent
+// Periodically send usage updates to the master
 setInterval(() => {
     if (Object.keys(aggregatedUsage).length > 0) {
-        parentPort.postMessage({ type: "usageUpdate", data: aggregatedUsage });
+        process.send({ type: "usageUpdate", data: aggregatedUsage });
     }
 }, 1000);
 
@@ -64,13 +69,13 @@ const server = http.createServer((clientReq, clientRes) => {
     });
 
     proxyReq.on("error", (err) => {
-        console.error(`[ERROR] Proxy request error: ${err.message}`);
+        logger("error", `Proxy request error: ${err.message}`);
         clientRes.writeHead(500);
         clientRes.end("Internal Server Error");
     });
 
     proxyReq.on("timeout", () => {
-        console.error("[ERROR] Proxy request timeout");
+        logger("error", "Proxy request timeout");
         proxyReq.destroy();
         clientRes.writeHead(504);
         clientRes.end("Gateway Timeout");
@@ -106,20 +111,20 @@ server.on("connect", (req, clientSocket, head) => {
     });
 
     targetSocket.on("error", (err) => {
-        console.error(`[ERROR] Target connection error: ${err.message}`);
+        logger("error", `Target connection error: ${err.message}`);
         clientSocket.end();
     });
 
     clientSocket.on("error", (err) => {
-        console.error(`[ERROR] Client connection error: ${err.message}`);
+        logger("error", `Client connection error: ${err.message}`);
         targetSocket.end();
     });
 });
 
-// Handle terminate message
-parentPort.on("message", (msg) => {
+// Handle terminate message from the master
+process.on("message", (msg) => {
     if (msg.type === "terminate") {
-        console.info("[INFO] Terminating worker process");
+        logger("info", "Terminating worker process");
         server.close(() => process.exit(0));
     }
 });
@@ -127,5 +132,5 @@ parentPort.on("message", (msg) => {
 // Start the server
 server.listen(0, () => {
     const port = server.address().port;
-    parentPort.postMessage({ port });
+    process.send({ type: "initialized", port });
 });
