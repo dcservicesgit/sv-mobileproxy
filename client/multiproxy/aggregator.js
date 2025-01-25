@@ -31,8 +31,8 @@ module.exports = {
                 const aggregatedData = module.exports.totaldata;
 
                 if (!Array.isArray(portPool) || portPool.length === 0) {
-                    logger('error', "Port pool is empty. Cannot start Aggregator.");
-                    return reject(new Error("Port pool is empty."));
+                    logger('error', "Port pool is empty.");
+                    //return reject(new Error("Port pool is empty."));
                 }
 
                 // Setup cluster to use the worker script aggProxyWorker.js

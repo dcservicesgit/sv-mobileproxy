@@ -22,7 +22,7 @@ class MultiProxy {
         this.adaptormap = {};
         this.adaptormapConnect = {};
         this.bindPort = 8980
-        this.screenOn = false
+        this.screenOn = true
 
         this.aggbooted = false
     }
@@ -52,28 +52,29 @@ class MultiProxy {
             let ports = []
             Object.keys(this.adaptormapConnect).forEach((adapterkey) => {
                 let adaptor = this.adaptormapConnect[adapterkey]
-                if (adaptor.proxyclearport) {
+                if (adaptor.proxyclearport && adaptor.state === 'configured') {
                     ports.push(adaptor.proxyclearport)
                 }
             })
 
-            if (ports.length > 0) {
-
-                if (this.aggbooted) {
-                    if (JSON.stringify(Aggregator.portPool) !== JSON.stringify(ports)) {
-                        Aggregator.updatePortPool(ports)
-                    }
-                }
-                else {
-                    logger(`info`, 'starting boot of Agg')
-                    console.dir(ports)
-                    this.aggbooted = true
-                    Aggregator.portPool = ports
-                    await Aggregator.StartAgg()
+            if (this.aggbooted) {
+                if (JSON.stringify(Aggregator.portPool) !== JSON.stringify(ports)) {
                     Aggregator.updatePortPool(ports)
                 }
 
             }
+            else {
+                logger(`info`, 'starting boot of Agg')
+                console.dir(ports)
+                this.aggbooted = true
+                Aggregator.portPool = []
+                await Aggregator.StartAgg()
+                setTimeout(() => {
+                    Aggregator.updatePortPool(ports)
+                }, 500)
+
+            }
+
         }, 5000)
 
 
@@ -143,15 +144,20 @@ class MultiProxy {
                     type: iface.type,
                 };
 
-                if (this.config.wans.includes(iface.iface)) {
+                if (this.config.wans[iface.iface]) {
+                    let ifaceconfig = this.config.wans[iface.iface]
                     if (!this.adaptormapConnect[iface.iface]) {
                         this.adaptormapConnect[iface.iface] = {
                             state: 'setup',
                             myip: 'unknownip',
                             proxyclearport: null,
-                            errors: 0
+                            errors: 0,
+                            config: ifaceconfig
                         }
                     }
+                }
+                else {
+                    console.log(`Available adaptor ${iface.iface}`)
                 }
             });
 
@@ -179,8 +185,27 @@ class MultiProxy {
 
                 if (tempport) {
                     adaptorConnect.proxyclearport = tempport
-                    adaptorConnect.state = 'configured'
+                    adaptorConnect.state = 'nointernet'
                     logger('success', chalk.green(`Setup Success on ${iface} ${adaptor.ip4}`))
+                }
+            }
+
+            if (adaptorConnect.state === 'nointernet') {
+
+
+                //test internet
+                logger('info', chalk.yellow(`Testing Internet Setup on ${iface} ${adaptor.ip4} via ${adaptorConnect.proxyclearport}`))
+                let result = await this.checkProxyEndpoint(adaptorConnect.proxyclearport)
+
+                if (result) {
+                    adaptorConnect.myip = result
+                    adaptorConnect.state = 'configured'
+                }
+                else {
+                    logger('info', chalk.yellow(`Testing Setup on ${iface} ${adaptor.ip4} FAILED TO OBTAIN IP`))
+                    adaptorConnect.state = 'nointernet'
+                    //await proxyManager.LocalProxycloseServer(iface)
+                    continue
                 }
             }
         }
@@ -253,6 +278,8 @@ class MultiProxy {
                 try {
                     const ip = await getIpViaProxy();
                     adaptorConnect.myip = ip
+
+                    logger(`success`, `${iface} Internet confirmed`)
                     // You can store or process the IP as needed
                 } catch (error) {
                     console.error(`Failed to get IP for interface ${iface} via proxy ${proxyHost}:${proxyPort}:`, error.message);
@@ -260,7 +287,9 @@ class MultiProxy {
                     this.adaptormapConnect[iface].errors++
 
                     if (this.adaptormapConnect[iface].errors > 5) {
-                        await proxyManager.LocalProxyreconfigureServer(iface, this.adaptormap[iface].ip4)
+                        this.adaptormapConnect[iface].errors = 0
+                        logger(`error`, `${iface} Failed, no internet!`)
+                        this.adaptormapConnect[iface].state = 'nointernet'
                     }
                 }
             }
@@ -269,7 +298,7 @@ class MultiProxy {
 
 
 
-    async checkProxyEndpoint(port, username, password) {
+    async checkProxyEndpoint(port, username = null, password = null) {
 
         const proxyPort = port;
         const proxyHost = 'localhost'; // Assuming proxy is running on localhost
@@ -280,18 +309,22 @@ class MultiProxy {
         // Promisify the HTTP request
         const getIpViaProxy = () => {
             return new Promise((resolve, reject) => {
-                const options = {
+                let options = {
                     host: proxyHost,
                     port: proxyPort,
                     method: 'GET',
                     path: targetUrl, // Full URL for proxy request
                     headers: {
                         Host: 'httpbin.org', // Set Host header for the target server
-                        "Proxy-Authorization": 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64'),
+
                     },
                     // Optionally, you can set a timeout
                     timeout: 5000, // in milliseconds
                 };
+
+                if (username) {
+                    options.headers["Proxy-Authorization"] = 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64')
+                }
 
                 const req = http.request(options, (res) => {
                     let data = '';
@@ -328,9 +361,9 @@ class MultiProxy {
         };
 
         try {
-            logger('info', chalk.green(`proxy ${proxyPort} Testing`))
+            logger('info', chalk.yellow(`checkProxyEndpoint ${proxyPort} Testing`))
             const ip = await getIpViaProxy();
-            logger('success', chalk.green(`proxy ${proxyPort} Success`))
+            logger('success', chalk.green(`checkProxyEndpoint ${proxyPort} Success`))
 
             return ip
             // You can store or process the IP as needed
@@ -352,23 +385,29 @@ class MultiProxy {
             const adaptor = this.adaptormap[iface];
             const adaptorConnect = this.adaptormapConnect[iface];
 
-            if (!adaptorConnect.last_update) {
-                //make it out of date 
-                adaptorConnect.last_update = new Date(0).toISOString()
+            if (adaptorConnect.config.autoreboot && adaptorConnect.state == 'configured') {
+                if (!adaptorConnect.last_update) {
+                    //make it out of date 
+                    adaptorConnect.last_update = new Date(0).toISOString()
+                }
+
+                if (new Date().getTime() > new Date(adaptorConnect.last_update).getTime()) {
+
+                    let nextRebootTime = new Date();
+
+                    // Generate a random integer between 5 and 15 (inclusive)
+                    let randomMinutes = Math.floor(Math.random() * 11) + 5;
+
+                    // Add the random number of minutes to the current time
+                    nextRebootTime.setMinutes(nextRebootTime.getMinutes() + randomMinutes);
+
+                    adaptorConnect.last_update = nextRebootTime.toISOString()
+
+                    //Start reset process
+                    logger(`info`, `[refreshdevices] Resetting ${iface} as ${adaptor.ip4}`)
+                    await ModemSupport.reboot(iface, adaptor.ip4)
+                }
             }
-
-            if (new Date().getTime() > new Date(adaptorConnect.last_update).getTime()) {
-
-                let nextRebootTime = new Date()
-                nextRebootTime.setMinutes(nextRebootTime.getMinutes() + 5)
-
-                adaptorConnect.last_update = nextRebootTime.toISOString()
-
-                //Start reset process
-                logger(`info`, `[refreshdevices] Resetting ${iface} as ${adaptor.ip4}`)
-                await ModemSupport.reboot(iface, adaptor.ip4)
-            }
-
         }
 
         logger(`info`, '[refreshdevices] Ended')

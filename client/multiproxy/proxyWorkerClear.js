@@ -50,7 +50,7 @@ setInterval(() => {
     if (Object.keys(aggregatedUsage).length > 0) {
         process.send({ type: "usageUpdate", data: aggregatedUsage });
         // Optionally, reset aggregatedUsage if needed
-        // aggregatedUsage = {};
+        aggregatedUsage = {};
     }
 }, 1000);
 

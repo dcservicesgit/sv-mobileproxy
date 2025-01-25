@@ -1,7 +1,9 @@
 {
     "nodename": "Development",
     "key": "",
-    "wans": [
-        "en0"
-    ]
+    "wans": {
+        "en0": {
+            "autoreboot": true
+        }
+    }
 }
