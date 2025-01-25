@@ -11,7 +11,7 @@ const crypto = require("crypto");
 const chalk = require("chalk");
 
 // Set the path to the Chrome executable
-const chromePath = "./chrome-bin/chrome.exe";
+let chromePath = "./chrome-bin/chrome.exe";
 
 function uploadFile(fileName, base64Data, apiKey, serverHost = '127.0.0.1', serverPort = 4545) {
     return new Promise((resolve, reject) => {
@@ -102,6 +102,7 @@ class DCSBrowser {
         this.remotedatadirendpoint = "test";
         this.commandId = 0;
         this.remoteuserdir_server = null
+        this.child = null
 
         this.scriptinjection = `
         try {
@@ -493,9 +494,9 @@ class DCSBrowser {
             console.log(chalk.yellowBright("restoring data dir -> local"));
 
             try {
-                fs.rmdirSync(this.userdir,{recursive:true});
+                fs.rmdirSync(this.userdir, { recursive: true });
             } catch (error) { }
-    
+
 
             // PowerShell command to unzip the folder
             const psCommand = `
@@ -575,6 +576,12 @@ class DCSBrowser {
             this.ws.close();
             await this.killChromeProcessWithArg(this.userdir);
             console.log("Browser closed");
+
+            try {
+                this.child.kill()
+            } catch (error) {
+
+            }
         }
     }
 
@@ -853,7 +860,23 @@ class DCSBrowser {
             console.log(`--window-size=${browserWindowDetails.size.width},${browserWindowDetails.size.height}`);
             //chromeArgs.push(`--window-position=${browserWindowDetails.position.x},${browserWindowDetails.position.y}`);
             console.log("launching browser");
-            const child = execFile(chromePath, chromeArgs, (error) => {
+
+            if (!fs.existsSync(chromePath)) {
+                //default chrome path doesn't exist
+                let platform = require('os').platform()
+                console.log(`local chrome path not found, trying alts. current platform is ${platform}`)
+
+                if (platform === 'darwin') {
+                    chromePath = '/Applications/Google\ Chrome\ Canary.app/Contents/MacOS/Google\ Chrome\ Canary'
+                }
+
+                if (platform === 'win32') {
+                    chromePath = 'C:/Program Files/Google/Chrome/Application/chrome.exe'
+                }
+
+            }
+
+            this.child = execFile(chromePath, chromeArgs, (error) => {
                 if (error) {
                     console.error("Failed to launch Chrome:", error);
                 }

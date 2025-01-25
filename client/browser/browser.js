@@ -60,17 +60,17 @@ module.exports = {
 
     browsersetup: async (uniqueid, safe, data) => {
         if (!module.exports.chromeua) {
-            module.exports.chromeua = module.exports.getChromeUserAgentFromFolders();
-            console.log("chome agent found:" + module.exports.chromeua);
-        }
+            try {
+                module.exports.chromeua = module.exports.getChromeUserAgentFromFolders();
+                console.log("chome agent found:" + module.exports.chromeua);
+            } catch (error) {
+                console.log("chome agent not found");
+            }
 
-        if (module.exports.chromeua === null) {
-            console.error("Error chome agent found:" + module.exports.chromeua);
-            return;
         }
 
         let proxy = data.proxy;
-        let datadir = "C:\\Windows\\Temp\\ohm__" + uniqueid;
+        let datadir = "C:\\Windows\\Temp\\tempbrowser_" + uniqueid;
 
         /*
         if (module.exports.browsers[uniqueid]) {

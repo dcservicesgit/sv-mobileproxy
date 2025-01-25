@@ -344,6 +344,7 @@ class MultiProxy {
 
 
     async refreshdevices() {
+        logger(`info`, '[refreshdevices] Started')
         const clearConnections = Object.keys(this.adaptormapConnect);
 
         for (let index = 0; index < clearConnections.length; index++) {
@@ -356,15 +357,21 @@ class MultiProxy {
                 adaptorConnect.last_update = new Date(0).toISOString()
             }
 
-            if (new Date().getTime() < new Date(adaptorConnect).getTime()) {
+            if (new Date().getTime() > new Date(adaptorConnect.last_update).getTime()) {
+
+                let nextRebootTime = new Date()
+                nextRebootTime.setMinutes(nextRebootTime.getMinutes() + 5)
+
+                adaptorConnect.last_update = nextRebootTime.toISOString()
 
                 //Start reset process
-
-                await ModemSupport.reboot()
+                logger(`info`, `[refreshdevices] Resetting ${iface} as ${adaptor.ip4}`)
+                await ModemSupport.reboot(iface, adaptor.ip4)
             }
 
         }
 
+        logger(`info`, '[refreshdevices] Ended')
     }
 }
 

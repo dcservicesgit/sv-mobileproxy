@@ -34,47 +34,56 @@ module.exports = {
     },
 
     rebootDevice: async (common, data) => {
-        let uniqueid = 'huawei'
-        let progress = await common.browser.browsersetup(uniqueid, false, data, common);
+        let uniqueid = data.uniqueid
+        try {
+            let progress = await common.browser.browsersetup(uniqueid, false, data, common);
 
-        if (!progress) {
-            return false;
-        }
+            if (!progress) {
+                return false;
+            }
 
-        const startTime = Date.now();
-        let pageworked = await common.browser.pagesetup(uniqueid, `http://${data.deviceip}`, common);
-        const endTime = Date.now();
-        const firstLoadTime = endTime - startTime;
-        console.log(`page took ${firstLoadTime}ms to load`);
+            const startTime = Date.now();
+            let pageworked = await common.browser.pagesetup(uniqueid, `http://${data.deviceip}`, common);
+            const endTime = Date.now();
+            const firstLoadTime = endTime - startTime;
+            console.log(`page took ${firstLoadTime}ms to load`);
 
-        if (!pageworked) {
-            return false;
-        }
-        let page = common.browser.browsers[uniqueid].page;
-        let cursor = common.browser.browsers[uniqueid].cursor;
-        let browser = common.browser.browsers[uniqueid].browser;
+            if (!pageworked) {
+                return false;
+            }
+            let page = common.browser.browsers[uniqueid].page;
+            let cursor = common.browser.browsers[uniqueid].cursor;
+            let browser = common.browser.browsers[uniqueid].browser;
 
-        await page.setDefaultNavigationTimeout(10000);
-        await page.setDefaultTimeout(5000);
+            await page.setDefaultNavigationTimeout(10000);
+            await page.setDefaultTimeout(5000);
 
-        let output = await module.exports.login(page, 'admin', 'admin')
+            let output = await module.exports.login(page, 'admin', 'admin')
 
-        if (output === 'cancelop') {
+            if (output === 'cancelop') {
+                await common.browser.shutdownpage(uniqueid, false, common);
+                await browser.close()
+                return
+            }
+
+
+            await page.goto(`http://${data.deviceip}/html/reboot.html`)
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            await page.waitForSelector('#reboot_apply_button')
+            await page.click('#reboot_apply_button')
+            await page.waitForSelector('#pop_confirm')
+            await page.click('#pop_confirm')
+            await new Promise((resolve) => setTimeout(resolve, 2000));
             await common.browser.shutdownpage(uniqueid, false, common);
-            await browser.close()
-            return
+        } catch (error) {
+            console.error(error)
+        }
+        try {
+            await common.browser.browsers[uniqueid].browser.close()
+        } catch (error) {
+
         }
 
-
-        await page.goto(`http://${data.deviceip}/html/reboot.html`)
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        await page.waitForSelector('#reboot_apply_button')
-        await page.click('#reboot_apply_button')
-        await page.waitForSelector('#pop_confirm')
-        await page.click('#pop_confirm')
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        await common.browser.shutdownpage(uniqueid, false, common);
-        await browser.close()
     },
 
     login: async (page, username, password) => {
@@ -223,7 +232,7 @@ module.exports = {
         const { execSync } = require('child_process')
 
         if (!page) {
-            let uniqueid = '123'
+            let uniqueid = data.uniqueid
             let progress = await common.browser.browsersetup(uniqueid, false, data, common);
             console.log(progress)
 
@@ -294,6 +303,14 @@ module.exports = {
             await new Promise((resolve) => setTimeout(resolve, 2000));
             await common.browser.shutdownpage(uniqueid, false, common);
             await browser.close()
+        }
+
+        try {
+            if (!page) {
+                await common.browser.browsers[uniqueid].browser.close()
+            }
+        } catch (error) {
+
         }
 
     }
