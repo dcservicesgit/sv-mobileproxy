@@ -140,7 +140,7 @@ module.exports = {
      * @param {Array<number>} newPortPool - Updated array of proxy server ports.
      */
     updatePortPool: (newPortPool) => {
-        if (!Array.isArray(newPortPool) || newPortPool.length === 0) {
+        if (!Array.isArray(newPortPool)) {
             logger('error', "Invalid portPool provided.");
             return;
         }

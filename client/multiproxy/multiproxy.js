@@ -155,10 +155,15 @@ class MultiProxy {
                             config: ifaceconfig
                         }
                     }
+
+                    
                 }
                 else {
                     console.log(`Available adaptor ${iface.iface}`)
                 }
+
+
+
             });
 
             // Display the filtered adapters

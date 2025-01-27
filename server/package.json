@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "fastify": "^5.2.1",
+    "fastify-multipart": "^5.3.1",
+    "fs-extra": "^11.3.0"
+  }
+}
